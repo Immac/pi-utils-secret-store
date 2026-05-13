@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["./node_modules/@earendil-works/pi-coding-agent"],
+      "@earendil-works/pi-ai": ["./node_modules/@earendil-works/pi-ai"]
+    }
+  },
+  "include": ["src", "test"]
+}

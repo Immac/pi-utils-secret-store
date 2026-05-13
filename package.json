@@ -1,0 +1,29 @@
+{
+  "name": "secret-store",
+  "version": "1.0.0",
+  "description": "Safe secret storage for pi agents — ask for secrets via user prompts, persist to encrypted JSON store, with do-not-persist exceptions and default sudo protection",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "secrets", "security", "credentials"],
+  "license": "MIT",
+  "scripts": {
+    "validate": "tsc --noEmit --skipLibCheck",
+    "test": "npx tsx test/secret-store.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@earendil-works/pi-ai": "^0.74.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.0.0",
+    "@types/node": "^22.0.0"
+  },
+  "pi": {
+    "extensions": ["./src/extensions/secret-store/secret-store.ts"]
+  }
+}
