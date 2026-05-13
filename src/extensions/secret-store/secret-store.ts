@@ -1,28 +1,32 @@
 /**
  * Secret Store — Safe secret management for pi agents.
  *
- * Provides LLM-callable tools to:
- * - Ask the user for secrets (passwords, API keys, tokens) via TUI prompt
- * - Persist secrets to an encrypted (0600-permission) JSON store
- * - Mark secrets as "do not persist" — kept only in memory for the session
- * - Default protection: sudo, password, passwd, root, etc. are NEVER persisted
+ * Built on PI's AuthStorage (~/.pi/agent/auth.json), which supports:
+ * - Persistent API key storage with 0600-permission JSON
+ * - In-memory runtime overrides via setRuntimeApiKey()
+ * - Shell command resolution via !prefix (e.g. "!pass show ...")
+ *
+ * Additional features:
+ * - Do-not-persist blocklist for sensitive key patterns
+ * - Two-step get_secret → with_secret flow prevents secret leakage
+ *   into tool result content, session history, and bash history
+ * - Confirmation dialogs on destructive operations
  *
  * Usage from LLM:
  *   ask_secret(key: "github_token", prompt: "Enter your GitHub personal access token")
  *   get_secret(key: "github_token")
+ *   with_secret(key: "github_token", command: "curl -H 'Authorization: Bearer $SECRET' ...")
  *   list_secrets()
  *   clear_secret(key: "github_token")
  *   forget_secrets()
  */
 
-import { resolve } from "node:path";
-import { homedir } from "node:os";
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SecretStore } from "./store.js";
+import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { confirmDestructiveAction } from "./confirm.js";
 
 const execAsync = promisify(execCb);
@@ -31,38 +35,71 @@ const execAsync = promisify(execCb);
 // Runtime State
 // =============================================================================
 
-let store = new SecretStore({
-  storePath: resolve(homedir(), ".pi", "agent", "secrets.enc"),
-});
+/**
+ * AuthStorage-backed credential store.
+ * Reads/writes ~/.pi/agent/auth.json with 0600 permissions.
+ * Also checks environment variables and supports !command shell resolution.
+ */
+let auth = AuthStorage.create();
 
 /**
- * In-memory cache for secrets retrieved via get_secret.
- * The secret value is stored here so with_secret can inject it into a
- * subprocess environment without ever putting it in tool result content.
- * Cleared on session_shutdown.
+ * Track which keys are ephemeral (set via setRuntimeApiKey vs auth.set).
+ * Used so list_secrets can report persistence status accurately.
  */
-const secretCache = new Map<string, string>();
+const ephemeralSecrets = new Set<string>();
+
+// =============================================================================
+// Blocklist — keys matching these patterns are NEVER persisted
+// =============================================================================
+
+const BLOCKLIST = new Set([
+  "sudo",
+  "password",
+  "passwd",
+  "pass",
+  "root",
+  "admin",
+  "root_password",
+  "sudo_password",
+  "admin_password",
+  "db_password",
+  "database_password",
+  "pgpass",
+  "mysql_password",
+  "ssh_key",
+  "ssh_key_passphrase",
+  "token",
+  "access_token",
+  "secret_token",
+  "api_secret",
+]);
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9_]/g, "");
+}
+
+function isDoNotPersist(key: string): boolean {
+  const normalized = normalizeKey(key);
+  if (BLOCKLIST.has(normalized)) return true;
+  for (const entry of BLOCKLIST) {
+    if (normalized.includes(entry)) return true;
+  }
+  return false;
+}
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-/**
- * Sanitize a secret value for display — never leak it in logs or error messages.
- */
 function sanitizeForDisplay(value: string): string {
   if (value.length <= 4) return "****";
   return value.slice(0, 2) + "****" + value.slice(-2);
 }
 
-/**
- * Mask the full secret value from any output content that might be shown to user.
- * Returns a safe summary message with the key, length hint, and sanitized preview.
- */
 function secretSummary(key: string, value: string, persisted: boolean): string {
   const preview = sanitizeForDisplay(value);
   const lengthHint = `(${value.length} chars)`;
-  const storage = persisted ? "persisted to backend" : "in-memory only (not persisted)";
+  const storage = persisted ? "persisted to auth.json" : "in-memory only (not persisted)";
   return `Secret "${key}" ${lengthHint} stored (${storage}, value: ${preview})`;
 }
 
@@ -72,21 +109,20 @@ function secretSummary(key: string, value: string, persisted: boolean): string {
 
 export default function (pi: ExtensionAPI) {
   // ===========================================================================
-  // Lifecycle — load persisted secrets on session start
+  // Lifecycle
   // ===========================================================================
 
   pi.on("session_start", async (_event, ctx) => {
-    await store.load();
-    const count = store.list().length;
-    const backend = store.getBackendName();
+    auth.reload();
+    const count = auth.list().length;
     if (count > 0) {
-      ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s) [${backend}]`);
+      ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
     }
   });
 
-  pi.on("session_shutdown", async (_event) => {
-    await store.save();
-    secretCache.clear();
+  pi.on("session_shutdown", async () => {
+    // Nothing to flush — AuthStorage persists via file write on each set()
+    ephemeralSecrets.clear();
   });
 
   // ===========================================================================
@@ -98,12 +134,14 @@ export default function (pi: ExtensionAPI) {
     label: "Ask Secret",
     description:
       "Prompt the user to enter a secret value (password, API key, token, etc.) " +
-      "and store it securely. The secret can be persisted to a safe JSON file " +
-      "(~/.pi/agent/secrets.json) or kept only in memory (not persisted). " +
-      "Secrets with keys matching 'sudo', 'password', 'passwd', " +
-      "'root', 'admin', 'token', or similar are NEVER persisted to disk — " +
-      "the blocklist is absolute and cannot be overridden. Use this when you need " +
-      "a credential the user hasn't provided yet.",
+      "and store it securely. Uses PI's AuthStorage (~/.pi/agent/auth.json) with " +
+      "0600 permissions. The secret can be persisted or kept only in memory. " +
+      "Secrets with keys matching 'sudo', 'password', 'passwd', 'root', 'admin', " +
+      "'token', or similar are NEVER persisted — the blocklist is absolute. " +
+      "Use this when you need a credential the user hasn't provided yet.\n\n" +
+      "Storage supports !command syntax: if you manually edit auth.json, " +
+      "the key value can be a shell command prefixed with ! (e.g., " +
+      '"!pass show api/key"), and AuthStorage will resolve it at runtime.',
     promptSnippet: "Prompt the user for a secret (password, API key, token) and store it securely",
     promptGuidelines: [
       "Use ask_secret when you need a credential, password, API key, or token the user hasn't provided yet.",
@@ -127,7 +165,7 @@ export default function (pi: ExtensionAPI) {
       persist: Type.Optional(
         Type.Boolean({
           description:
-            "Whether to persist to disk (default: true for non-blocked keys). " +
+            "Whether to persist to auth.json (default: true for non-blocked keys). " +
             "Set to false to keep a non-blocked secret only in memory for this session. " +
             "Has no effect on blocked keys — they are NEVER persisted regardless.",
         })
@@ -137,30 +175,23 @@ export default function (pi: ExtensionAPI) {
       const { key, prompt: promptText, persist } = params;
 
       // --- Show context in the prompt ---
-      const blocked = store.wouldBeBlocked(key);
+      const blocked = isDoNotPersist(key);
       const blockReason = blocked
         ? "\n\n⚠ This secret matches do-not-persist rules and will NEVER be written to disk."
         : "";
 
-      const existing = store.get(key);
+      const existing = auth.get(key);
       const overwriteHint = existing
         ? `\n(This will overwrite an existing secret for "${key}".)`
         : "";
 
       // --- Ask the user via PI's built-in TUI input dialog ---
-      // Uses ctx.ui.input() (same mechanism as PI's own /login flow) rather than
-      // a custom overlay component, because custom overlays don't handle terminal
-      // paste reliably across all terminal emulators (e.g. Kitty bracketed paste).
-      // PI's built-in Input component handles paste correctly.
-      let value: string | undefined;
-
-      value = await ctx.ui.input(
+      const value = await ctx.ui.input(
         `🔐 ${promptText}${blockReason}${overwriteHint}`,
         ""
       );
 
       if (value === undefined || value.trim() === "") {
-        // ctx.ui.input() returns undefined on cancel (Escape pressed)
         return {
           content: [
             {
@@ -172,21 +203,30 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // --- Store ---
+      // --- Store via AuthStorage ---
       // Blocked keys are NEVER persisted regardless of the persist parameter.
       // For non-blocked keys: persist=true or undefined=persist, false=ephemeral.
       let actuallyPersisted: boolean;
+
       if (blocked) {
-        actuallyPersisted = store.set(key, value); // persist follows blocklist
+        // Blocked → runtime override only
+        auth.setRuntimeApiKey(key, value);
+        ephemeralSecrets.add(key);
+        actuallyPersisted = false;
+      } else if (persist === false) {
+        // Explicit ephemeral
+        auth.setRuntimeApiKey(key, value);
+        ephemeralSecrets.add(key);
+        actuallyPersisted = false;
       } else {
-        actuallyPersisted = store.set(key, value, persist);
+        // Persist to auth.json
+        auth.set(key, { type: "api_key", key: value });
+        ephemeralSecrets.delete(key);
+        actuallyPersisted = true;
       }
 
-      // Save to disk if anything changed
-      await store.save();
-
       // --- Update status ---
-      const count = store.list().length;
+      const count = auth.list().length;
       ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
 
       // --- Summarize (never leak the full value) ---
@@ -219,9 +259,10 @@ export default function (pi: ExtensionAPI) {
     name: "get_secret",
     label: "Get Secret",
     description:
-      "Retrieve a previously stored secret by its key. Returns the full secret value " +
-      "so you can use it (e.g., as an API key, password for a command). " +
-      "If the secret doesn't exist, you'll need to use ask_secret first.",
+      "Retrieve a previously stored secret by its key. The secret is cached " +
+      "in memory so you can use it with with_secret — the raw value is never " +
+      "exposed in tool result content. If the secret doesn't exist, you'll " +
+      "need to use ask_secret first.",
     promptSnippet: "Retrieve a previously stored secret by key",
     parameters: Type.Object({
       key: Type.String({
@@ -230,9 +271,9 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { key } = params;
-      const value = store.get(key);
 
-      if (value === undefined) {
+      // Check existence via auth.get (checks auth.json + runtime overrides)
+      if (!auth.has(key)) {
         return {
           content: [
             {
@@ -244,25 +285,34 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Cache the secret in memory so with_secret can inject it into a
-      // subprocess environment. The raw value never enters tool result content.
-      secretCache.set(key, value);
+      // Resolve the actual value — this runs !commands if applicable
+      const value = await auth.getApiKey(key);
+      if (value === undefined) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Secret "${key}" exists but could not be resolved. If it uses a !command, check that the command works.`,
+            },
+          ],
+          details: { found: false, key, reason: "resolution_failed" },
+        };
+      }
 
       const length = value.length;
-      const persisted = store.list().find(s => s.key === key)?.persisted ?? false;
-      const tag = persisted ? "persisted" : "session-only";
+      const isEphemeral = ephemeralSecrets.has(key);
+      const tag = isEphemeral ? "session-only" : "persisted";
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `Secret "${key}" (${length} chars, ${tag}) retrieved and cached. Use with_secret(key="${key}", command="...") to run a command with it injected as \$SECRET.`,
+            text: `Secret "${key}" (${length} chars, ${tag}) retrieved. Use with_secret(key="${key}", command="...") to run a command with it injected as \\$SECRET.`,
           },
         ],
-        details: { found: true, key, valueLength: length, persisted },
+        details: { found: true, key, valueLength: length, persisted: !isEphemeral },
       };
     },
-    // Custom rendering — never display the actual secret value in the TUI
     renderCall(args, theme, _context) {
       return new Text(
         theme.fg("toolTitle", theme.bold("get_secret ")) +
@@ -282,7 +332,6 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Show only metadata — mask the actual value from the TUI
       const lengthHint = ` (${details.valueLength} chars)`;
       const preview = "•".repeat(Math.min(details.valueLength ?? 0, 16));
       return new Text(
@@ -292,7 +341,7 @@ export default function (pi: ExtensionAPI) {
         " " +
         theme.fg("dim", preview) +
         "   " +
-        theme.fg("muted", "→ cached for with_secret"),
+        theme.fg("muted", "→ ready for with_secret"),
         0, 0
       );
     },
@@ -306,28 +355,23 @@ export default function (pi: ExtensionAPI) {
     name: "with_secret",
     label: "With Secret",
     description:
-      "Run a shell command with a previously retrieved secret injected as an " +
-      "environment variable. The secret must have been retrieved first via " +
-      "get_secret (which caches it in memory). The secret value is NEVER " +
-      "exposed in tool result content, session history, TUI display, or bash " +
-      "history — it's injected directly into the subprocess environment.\n" +
-      "\n" +
+      "Run a shell command with a previously stored secret injected as an " +
+      "environment variable. The secret is retrieved from AuthStorage " +
+      "(~/.pi/agent/auth.json) and injected directly into the subprocess " +
+      "environment. It never appears in tool result content, session history, " +
+      "TUI display, or bash history.\n\n" +
       "The secret is available as \\$SECRET inside the command by default. " +
-      "Use envVarName to pick a different variable name.\n" +
-      "\n" +
-      "After completion, the secret is consumed (removed from the in-memory " +
-      "cache). Re-run get_secret if you need it again.",
+      "Use envVarName to pick a different variable name.",
     promptSnippet: "Run a command with a cached secret injected as $SECRET env var",
     promptGuidelines: [
       "Use with_secret after get_secret to use a secret in a command without leaking it into conversation history or bash history.",
       "The secret is available as $SECRET inside the command by default. Set envVarName to change the variable name.",
-      "The secret is consumed after one use. Call get_secret again if you need it again.",
     ],
     parameters: Type.Object({
       key: Type.String({
         description:
-          "The key of the secret to use. Must have been retrieved via get_secret first " +
-          "(get_secret caches the value in memory for this tool).",
+          "The key of the secret to use. Must have been stored via ask_secret first. " +
+          "AuthStorage resolves !command syntax if the secret was stored as a shell command.",
       }),
       command: Type.String({
         description:
@@ -343,38 +387,44 @@ export default function (pi: ExtensionAPI) {
       ),
       timeout: Type.Optional(
         Type.Number({
-          description:
-            "Timeout in milliseconds for the command (default: 60000).",
+          description: "Timeout in milliseconds for the command (default: 60000).",
         })
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const { key, command, envVarName, timeout } = params;
 
-      // --- Look up the cached secret ---
-      const secret = secretCache.get(key);
+      // --- Look up the secret via AuthStorage ---
+      // auth.has() checks auth.json + runtime overrides
+      if (!auth.has(key)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Secret "${key}" is not stored. Use ask_secret(key="${key}", prompt="...") first.`,
+            },
+          ],
+          details: { executed: false, key, reason: "not_found" },
+        };
+      }
+
+      // Resolve the actual value — runs !commands if applicable
+      const secret = await auth.getApiKey(key);
       if (secret === undefined) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Secret "${key}" is not in the in-memory cache. Call get_secret(key="${key}") first to retrieve and cache it.`,
+              text: `Secret "${key}" exists but could not be resolved. If it uses a !command, check that the command works.`,
             },
           ],
-          details: { executed: false, key, reason: "not_cached" },
+          details: { executed: false, key, reason: "resolution_failed" },
         };
       }
 
       // --- Inject as env var and run ---
-      // Uses Node child_process.exec with custom env so the secret is injected
-      // directly into the subprocess environment. It never appears in:
-      //   - tool result content (no secret in session history)
-      //   - command line args (no secret in bash history or /proc)
-      //   - TUI display (renderResult masks everything)
       const varName = envVarName || "SECRET";
       const cwd = ctx.cwd;
-
-      // Truncation limits
       const maxBytes = 50 * 1024;
       const maxLines = 2000;
 
@@ -412,7 +462,6 @@ export default function (pi: ExtensionAPI) {
           },
         };
       } catch (e: any) {
-        // exec throws on non-zero exit or timeout — extract what we can
         const exitCode = e.code ?? (e.killed ? -1 : 1);
         const stderr = e.stderr ?? "";
         const stdout = e.stdout ?? "";
@@ -432,23 +481,18 @@ export default function (pi: ExtensionAPI) {
             stderr,
           },
         };
-      } finally {
-        // Consume the cached secret after use — one-shot cache
-        secretCache.delete(key);
       }
     },
-    // RenderCall — show the command but not the secret
     renderCall(args, theme, _context) {
       const varName = args.envVarName || "SECRET";
       return new Text(
         theme.fg("toolTitle", theme.bold("with_secret ")) +
         theme.fg("accent", args.key) +
-        theme.fg("muted", ` → \$${varName} `) +
+        theme.fg("muted", ` → \\$${varName} `) +
         theme.fg("dim", args.command.slice(0, 80)),
         0, 0
       );
     },
-    // RenderResult — show exit status
     renderResult(result, _options, theme, _context) {
       const details = result.details as
         | { executed: boolean; key: string; exitCode?: number; reason?: string }
@@ -463,13 +507,12 @@ export default function (pi: ExtensionAPI) {
 
       const code = details.exitCode ?? 0;
       const status = code === 0
-        ? theme.fg("success", `✓ `)
+        ? theme.fg("success", "✓ ")
         : theme.fg("error", `✗ (exit ${code}) `);
 
       return new Text(
         status +
-        theme.fg("accent", details.key) +
-        theme.fg("muted", " consumed"),
+        theme.fg("accent", details.key),
         0, 0
       );
     },
@@ -489,9 +532,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "List stored secret keys without revealing values",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const secrets = store.list();
+      const keys = auth.list();
 
-      if (secrets.length === 0) {
+      if (keys.length === 0) {
         return {
           content: [
             {
@@ -503,30 +546,31 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const lines = secrets.map((s) => {
-        const icon = s.persisted ? "💾" : "🧠";
-        const tag = s.persisted ? "persisted" : "session-only";
-        return `  ${icon} ${s.key} (${tag})`;
+      const lines = keys.map((k) => {
+        const persisted = !ephemeralSecrets.has(k);
+        const icon = persisted ? "💾" : "🧠";
+        const tag = persisted ? "persisted" : "session-only";
+        return `  ${icon} ${k} (${tag})`;
       });
 
-      const persistedCount = secrets.filter((s) => s.persisted).length;
-      const ephemeralCount = secrets.filter((s) => !s.persisted).length;
+      const persistedCount = keys.filter((k) => !ephemeralSecrets.has(k)).length;
+      const ephemeralCount = keys.filter((k) => ephemeralSecrets.has(k)).length;
 
       return {
         content: [
           {
             type: "text" as const,
             text:
-              `**${secrets.length} secret(s) stored:**\n` +
+              `**${keys.length} secret(s) stored:**\n` +
               lines.join("\n") +
               `\n\n_${persistedCount} persisted to disk, ${ephemeralCount} session-only (not persisted)_`,
           },
         ],
         details: {
-          count: secrets.length,
+          count: keys.length,
           persisted: persistedCount,
           ephemeral: ephemeralCount,
-          secrets: secrets.map((s) => ({ key: s.key, persisted: s.persisted })),
+          secrets: keys.map((k) => ({ key: k, persisted: !ephemeralSecrets.has(k) })),
         },
       };
     },
@@ -542,9 +586,9 @@ export default function (pi: ExtensionAPI) {
     description:
       "Delete a single stored secret by key. Requires the user to type the secret's name " +
       "in a confirmation prompt before deletion proceeds — nothing is deleted by accident. " +
-      "Removes the secret from both disk (if persisted) and in-memory cache. " +
-      "After clearing, you will need to call ask_secret to get a new value. " +
-      "\n\nUse when a credential has been rotated, compromised, or is no longer needed. " +
+      "Removes the secret from both disk (auth.json) and in-memory runtime overrides. " +
+      "After clearing, you will need to call ask_secret to get a new value.\n\n" +
+      "Use when a credential has been rotated, compromised, or is no longer needed. " +
       "Use forget_secrets instead if you want to wipe everything at once.",
     promptSnippet: "Delete one stored secret by key — user must type the name to confirm",
     promptGuidelines: [
@@ -560,8 +604,8 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const { key } = params;
 
-      // Check existence first — no need to confirm if nothing to delete
-      if (!store.has(key)) {
+      // Check existence first
+      if (!auth.has(key)) {
         return {
           content: [
             {
@@ -592,11 +636,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Confirmed — proceed with deletion
-      await store.delete(key);
-      await store.save();
+      // Confirmed — remove from both auth.json and runtime overrides
+      auth.remove(key);
+      ephemeralSecrets.delete(key);
 
-      const count = store.list().length;
+      const count = auth.list().length;
       if (count === 0) {
         ctx.ui.setStatus("secret-store", undefined);
       } else {
@@ -623,13 +667,13 @@ export default function (pi: ExtensionAPI) {
     name: "forget_secrets",
     label: "Forget All Secrets",
     description:
-      "⚠ IRREVERSIBLE — Clear ALL stored secrets from both disk and memory. " +
+      "⚠ IRREVERSIBLE — Clear ALL stored secrets from disk and memory. " +
       "Requires the user to type a long confirmation phrase before anything " +
       "is wiped — nothing is deleted by accident. " +
-      "All persisted secrets in ~/.pi/agent/secrets.json are deleted, and all in-memory " +
-      "ephemeral secrets (e.g., sudo passwords) are cleared. The user will need to re-enter " +
-      "every secret via ask_secret. " +
-      "\n\nUse this only when explicitly asked (e.g., 'clear all my credentials', 'start fresh'). " +
+      "All persisted secrets in ~/.pi/agent/auth.json are deleted, and all " +
+      "in-memory ephemeral secrets (e.g., sudo passwords) are cleared. " +
+      "The user will need to re-enter every secret via ask_secret.\n\n" +
+      "Use this only when explicitly asked (e.g., 'clear all my credentials', 'start fresh'). " +
       "For removing a single secret, use clear_secret instead.",
     promptSnippet: "⚠ IRREVERSIBLE — Clear ALL secrets — user must type a long affirmation to confirm",
     promptGuidelines: [
@@ -639,9 +683,9 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const count = store.list().length;
+      const keys = auth.list();
 
-      if (count === 0) {
+      if (keys.length === 0) {
         return {
           content: [
             {
@@ -653,7 +697,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Pick a random confirmation phrase so muscle memory doesn't help
+      // Pick a random confirmation phrase
       const phrases = [
         "I AM AWARE I AM DELETING ALL SECRETS I HAVE A GOOD REASON FOR THIS OR GOD HELP ME",
         "I UNDERSTAND THIS WILL WIPE EVERY SECRET I HAVE STORED AND I ACCEPT THE CONSEQUENCES",
@@ -667,7 +711,7 @@ export default function (pi: ExtensionAPI) {
       const required = phrases[Math.floor(Math.random() * phrases.length)];
       const confirmed = await confirmDestructiveAction(
         ctx,
-        `Type the following to confirm wiping all ${count} secrets:\n\n  ${required}`,
+        `Type the following to confirm wiping all ${keys.length} secrets:\n\n  ${required}`,
         required
       );
 
@@ -676,7 +720,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Wipe cancelled — confirmation phrase did not match. All ${count} secrets remain intact.`,
+              text: `Wipe cancelled — confirmation phrase did not match. All ${keys.length} secrets remain intact.`,
             },
           ],
           details: { removed: 0, reason: "cancelled" },
@@ -684,17 +728,21 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Confirmed — wipe everything
-      await store.clear();
+      for (const key of keys) {
+        auth.remove(key);
+        ephemeralSecrets.delete(key);
+      }
+
       ctx.ui.setStatus("secret-store", undefined);
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `All ${count} secret(s) have been permanently wiped from disk and memory (confirmed by user).`,
+            text: `All ${keys.length} secret(s) have been permanently wiped from disk and memory (confirmed by user).`,
           },
         ],
-        details: { removed: count },
+        details: { removed: keys.length },
       };
     },
   });
@@ -708,20 +756,21 @@ export default function (pi: ExtensionAPI) {
     label: "Get Secret Store Info",
     description:
       "Get information about the active secret storage backend and its location. " +
-      "Returns the name of the active backend (secret-service, macos-keychain, " +
-      "windows-credential-manager, or encrypted-file) and any relevant path. " +
-      "Useful for debugging which credential store is being used.",
+      "Returns the path to ~/.pi/agent/auth.json (PI's built-in AuthStorage).",
     promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+      const path = process.env.HOME
+        ? `${process.env.HOME}/.pi/agent/auth.json`
+        : "~/.pi/agent/auth.json";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Active backend: ${store.getBackendName()}`,
+            text: `AuthStorage: ${path}`,
           },
         ],
-        details: { backend: store.getBackendName() },
+        details: { backend: "AuthStorage (auth.json)", path },
       };
     },
   });
@@ -735,9 +784,7 @@ export default function (pi: ExtensionAPI) {
     label: "Get Active Backend",
     description:
       "Get the name of the active secret storage backend. " +
-      "Returns one of: secret-service (Linux), macos-keychain (macOS), " +
-      "windows-credential-manager (Windows), or encrypted-file (fallback). " +
-      "Useful to know where secrets are actually being stored.",
+      "Returns 'AuthStorage (auth.json)' — PI's built-in credential store.",
     promptSnippet: "Get the active secret storage backend name",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -745,10 +792,10 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: `Active secret storage backend: ${store.getBackendName()}`,
+            text: "Active secret storage: AuthStorage (~/.pi/agent/auth.json)",
           },
         ],
-        details: { backend: store.getBackendName() },
+        details: { backend: "AuthStorage (auth.json)" },
       };
     },
   });
@@ -760,23 +807,27 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("secrets", {
     description: "List stored secrets (without values)",
     handler: async (_args, ctx) => {
-      const secrets = store.list();
-      if (secrets.length === 0) {
+      const keys = auth.list();
+      if (keys.length === 0) {
         ctx.ui.notify("No secrets stored.", "info");
         return;
       }
-      const lines = secrets.map((s) => {
-        const icon = s.persisted ? "💾" : "🧠";
-        return `  ${icon} ${s.key}`;
+      const lines = keys.map((k) => {
+        const persisted = !ephemeralSecrets.has(k);
+        const icon = persisted ? "💾" : "🧠";
+        return `  ${icon} ${k}`;
       });
-      ctx.ui.notify(`🔐 ${secrets.length} secret(s):\n${lines.join("\n")}`, "info");
+      ctx.ui.notify(`🔐 ${keys.length} secret(s):\n${lines.join("\n")}`, "info");
     },
   });
 
   pi.registerCommand("secret-path", {
     description: "Show the secret store file path",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(`📁 ${store.getStorePath()}`, "info");
+      const path = process.env.HOME
+        ? `${process.env.HOME}/.pi/agent/auth.json`
+        : "~/.pi/agent/auth.json";
+      ctx.ui.notify(`📁 ${path}`, "info");
     },
   });
 }
