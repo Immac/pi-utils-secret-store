@@ -2,8 +2,14 @@
  * SecretServiceBackend — Linux Secret Service (libsecret) via secret-tool CLI.
  *
  * Uses the freedesktop.org Secret Service through the `secret-tool` command
- * (part of libsecret-tools package). Stores secrets with label "secret-store/<key>"
- * and attributes { application: "secret-store", key: "<key>" } for listing.
+ * (part of libsecret-tools package). Stores secrets with attributes
+ * { application: "secret-store", key: "<key>" } for individual lookup and clear.
+ *
+ * KEY INDEX: Because some Secret Service implementations (notably KDE's
+ * ksecretd) return incomplete results from `search` when multiple items share
+ * the same attribute, we maintain a separate key-index item stored under the
+ * reserved key `__keys__` as a JSON-serialized array. This index is updated
+ * on every set() and delete(), and list() reads it directly via lookup().
  *
  * Requires: secret-tool (libsecret-tools)
  *   Debian/Ubuntu: sudo apt install libsecret-tools
@@ -17,22 +23,29 @@ import type { SecretBackend } from "./interface.js";
 
 const execFileAsync = promisify(execFile);
 
+/** Escape a string for single-quoted shell usage */
+function shq(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
 
 const TOOL = "secret-tool";
 const APP_LABEL = "secret-store";
+const KEY_INDEX_KEY = "__keys__";
 
-function attrs(key: string): string[] {
-  return [
-    "--label=`secret-store/" + key + "`",
-    "application", APP_LABEL,
-    "key", key,
-  ];
+/** Build a shell command for `secret-tool store` with value piped via stdin */
+function storeCommand(key: string, value: string): string {
+  const label = `secret-store/${key}`;
+  return `echo ${shq(value)} | secret-tool store --label ${shq(label)} application ${APP_LABEL} key ${shq(key)}`;
 }
 
-const LIST_ATTRS = ["application", APP_LABEL];
+/** Attribute pairs for `secret-tool lookup` / `clear` */
+function searchArgs(key: string): string[] {
+  return ["application", APP_LABEL, "key", key];
+}
 
 // =============================================================================
 // Backend
@@ -52,7 +65,7 @@ export class SecretServiceBackend implements SecretBackend {
 
   async get(key: string): Promise<string | undefined> {
     try {
-      const { stdout } = await execFileAsync(TOOL, ["lookup", ...attrs(key).slice(1)]);
+      const { stdout } = await execFileAsync(TOOL, ["lookup", ...searchArgs(key)]);
       return stdout.replace(/\n$/, "") || undefined;
     } catch {
       return undefined;
@@ -60,14 +73,22 @@ export class SecretServiceBackend implements SecretBackend {
   }
 
   async set(key: string, value: string): Promise<void> {
-    const args = ["store", ...attrs(key), value];
-    await execFileAsync(TOOL, args);
+    // Store the secret value
+    await execFileAsync("sh", ["-c", storeCommand(key, value)]);
+    // Update the key index (add this key if not already present)
+    await this.updateIndex((keys) => {
+      if (!keys.includes(key)) keys.push(key);
+    });
   }
 
   async delete(key: string): Promise<boolean> {
     try {
-      const args = ["delete", ...attrs(key).slice(1)];
-      await execFileAsync(TOOL, args);
+      await execFileAsync(TOOL, ["clear", ...searchArgs(key)]);
+      // Update the key index (remove this key)
+      await this.updateIndex((keys) => {
+        const idx = keys.indexOf(key);
+        if (idx !== -1) keys.splice(idx, 1);
+      });
       return true;
     } catch {
       return false;
@@ -76,21 +97,34 @@ export class SecretServiceBackend implements SecretBackend {
 
   async list(): Promise<string[]> {
     try {
-      const args = ["search", ...LIST_ATTRS];
-      const { stdout } = await execFileAsync(TOOL, args);
-
-      // Parse secret-tool search output — it lists "key/<value>" lines
-      // Format is: key = <value> per attribute, then secret on line by itself
-      const keys: string[] = [];
-      for (const line of stdout.split("\n")) {
-        const match = line.match(/^key\s*=\s*(.+)$/);
-        if (match) {
-          keys.push(match[1].trim());
-        }
-      }
-      return [...new Set(keys)]; // deduplicate
+      // Read the key index stored under the reserved key
+      const raw = await this.get(KEY_INDEX_KEY);
+      if (!raw) return [];
+      const keys = JSON.parse(raw) as string[];
+      return Array.isArray(keys) ? keys : [];
     } catch {
       return [];
+    }
+  }
+
+  // ===========================================================================
+  // Key Index Management
+  // ===========================================================================
+
+  /**
+   * Read the current key index, apply a mutation, then write it back.
+   * Creates the index if it doesn't exist.
+   */
+  private async updateIndex(mutate: (keys: string[]) => void): Promise<void> {
+    try {
+      const raw = await this.get(KEY_INDEX_KEY);
+      const keys: string[] = raw ? (JSON.parse(raw) as string[]) : [];
+      mutate(keys);
+      // Write the updated index back using shell pipe (same as set)
+      const value = JSON.stringify(keys);
+      await execFileAsync("sh", ["-c", storeCommand(KEY_INDEX_KEY, value)]);
+    } catch (e) {
+      console.error(`[secret-store] Failed to update key index:`, e);
     }
   }
 }
