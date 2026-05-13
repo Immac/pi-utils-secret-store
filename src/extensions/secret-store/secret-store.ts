@@ -15,6 +15,8 @@
  *   forget_secrets()
  */
 
+import { resolve } from "node:path";
+import { homedir } from "node:os";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SecretStore } from "./store.js";
@@ -25,7 +27,9 @@ import { confirmDestructiveAction } from "./confirm.js";
 // Runtime State
 // =============================================================================
 
-let store = new SecretStore();
+let store = new SecretStore({
+  storePath: resolve(homedir(), ".pi", "agent", "secrets.enc"),
+});
 
 // =============================================================================
 // Helpers
@@ -46,7 +50,7 @@ function sanitizeForDisplay(value: string): string {
 function secretSummary(key: string, value: string, persisted: boolean): string {
   const preview = sanitizeForDisplay(value);
   const lengthHint = `(${value.length} chars)`;
-  const storage = persisted ? "persisted to disk" : "in-memory only (not persisted)";
+  const storage = persisted ? "persisted to backend" : "in-memory only (not persisted)";
   return `Secret "${key}" ${lengthHint} stored (${storage}, value: ${preview})`;
 }
 
@@ -62,8 +66,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     await store.load();
     const count = store.list().length;
+    const backend = store.getBackendName();
     if (count > 0) {
-      ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
+      ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s) [${backend}]`);
     }
   });
 
@@ -478,23 +483,50 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "get_secret_store_path",
-    label: "Get Secret Store Path",
+    label: "Get Secret Store Info",
     description:
-      "Get the absolute file path of the secret store JSON file " +
-      "(~/.pi/agent/secrets.json by default). " +
-      "Useful for debugging, manual inspection, or backing up secrets. " +
-      "The file is readable only by the owner (0600 permissions).",
-    promptSnippet: "Get the secret store file path",
+      "Get information about the active secret storage backend and its location. " +
+      "Returns the name of the active backend (secret-service, macos-keychain, " +
+      "windows-credential-manager, or encrypted-file) and any relevant path. " +
+      "Useful for debugging which credential store is being used.",
+    promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
       return {
         content: [
           {
             type: "text" as const,
-            text: `Secret store path: ${store.getStorePath()}`,
+            text: `Active backend: ${store.getBackendName()}`,
           },
         ],
-        details: { path: store.getStorePath() },
+        details: { backend: store.getBackendName() },
+      };
+    },
+  });
+
+  // ===========================================================================
+  // Tool: get_active_backend
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "get_active_backend",
+    label: "Get Active Backend",
+    description:
+      "Get the name of the active secret storage backend. " +
+      "Returns one of: secret-service (Linux), macos-keychain (macOS), " +
+      "windows-credential-manager (Windows), or encrypted-file (fallback). " +
+      "Useful to know where secrets are actually being stored.",
+    promptSnippet: "Get the active secret storage backend name",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Active secret storage backend: ${store.getBackendName()}`,
+          },
+        ],
+        details: { backend: store.getBackendName() },
       };
     },
   });
