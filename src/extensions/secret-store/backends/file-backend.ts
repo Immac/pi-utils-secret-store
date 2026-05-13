@@ -12,8 +12,8 @@
  */
 
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { resolve, dirname } from "node:path";
 import type { SecretBackend } from "./interface.js";
@@ -49,7 +49,6 @@ function deriveKey(salt: Buffer): Buffer {
 
 function readMachineId(): string {
   try {
-    const { readFileSync } = require("node:fs") as typeof import("node:fs");
     // Try various machine-id locations
     for (const p of ["/etc/machine-id", "/var/lib/dbus/machine-id", "/etc/hostid"]) {
       if (existsSync(p)) {
