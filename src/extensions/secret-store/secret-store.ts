@@ -17,11 +17,15 @@
 
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { SecretStore } from "./store.js";
-import { PasswordInput } from "./password-input.js";
 import { confirmDestructiveAction } from "./confirm.js";
+
+const execAsync = promisify(execCb);
 
 // =============================================================================
 // Runtime State
@@ -30,6 +34,14 @@ import { confirmDestructiveAction } from "./confirm.js";
 let store = new SecretStore({
   storePath: resolve(homedir(), ".pi", "agent", "secrets.enc"),
 });
+
+/**
+ * In-memory cache for secrets retrieved via get_secret.
+ * The secret value is stored here so with_secret can inject it into a
+ * subprocess environment without ever putting it in tool result content.
+ * Cleared on session_shutdown.
+ */
+const secretCache = new Map<string, string>();
 
 // =============================================================================
 // Helpers
@@ -74,6 +86,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event) => {
     await store.save();
+    secretCache.clear();
   });
 
   // ===========================================================================
@@ -94,7 +107,8 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Prompt the user for a secret (password, API key, token) and store it securely",
     promptGuidelines: [
       "Use ask_secret when you need a credential, password, API key, or token the user hasn't provided yet.",
-      "Use get_secret to retrieve a previously stored secret without re-prompting the user.",
+      "Use get_secret to retrieve a previously stored secret. It caches the value in memory so you can use it with with_secret — the raw value never enters the conversation history.",
+      "Use with_secret to run a command with a cached secret injected as an environment variable. This avoids leaking the value into tool results, session files, or bash history.",
       "Use list_secrets to see what secrets are already stored.",
       "Do NOT ask for secrets via bash or read tool — always use ask_secret for safe handling.",
     ],
@@ -133,31 +147,20 @@ export default function (pi: ExtensionAPI) {
         ? `\n(This will overwrite an existing secret for "${key}".)`
         : "";
 
-      // --- Ask the user (masked input) ---
+      // --- Ask the user via PI's built-in TUI input dialog ---
+      // Uses ctx.ui.input() (same mechanism as PI's own /login flow) rather than
+      // a custom overlay component, because custom overlays don't handle terminal
+      // paste reliably across all terminal emulators (e.g. Kitty bracketed paste).
+      // PI's built-in Input component handles paste correctly.
       let value: string | undefined;
 
-      if (ctx.hasUI) {
-        // Use masked custom component in interactive mode
-        value = await ctx.ui.custom<string | undefined>(
-          (_tui, _theme, _keybindings, done) => {
-            const input = new PasswordInput({
-              prompt: `🔐 ${promptText}`,
-              onSubmit: (v) => done(v),
-              onCancel: () => done(undefined),
-            });
-            return input;
-          },
-          { overlay: true }
-        );
-      } else {
-        // Fallback for non-interactive / print mode
-        value = await ctx.ui.input(
-          `🔐 ${promptText}`,
-          ""
-        );
-      }
+      value = await ctx.ui.input(
+        `🔐 ${promptText}${blockReason}${overwriteHint}`,
+        ""
+      );
 
       if (value === undefined || value.trim() === "") {
+        // ctx.ui.input() returns undefined on cancel (Escape pressed)
         return {
           content: [
             {
@@ -241,15 +244,234 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Cache the secret in memory so with_secret can inject it into a
+      // subprocess environment. The raw value never enters tool result content.
+      secretCache.set(key, value);
+
+      const length = value.length;
+      const persisted = store.list().find(s => s.key === key)?.persisted ?? false;
+      const tag = persisted ? "persisted" : "session-only";
+
       return {
         content: [
           {
             type: "text" as const,
-            text: value,
+            text: `Secret "${key}" (${length} chars, ${tag}) retrieved and cached. Use with_secret(key="${key}", command="...") to run a command with it injected as \$SECRET.`,
           },
         ],
-        details: { found: true, key, valueLength: value.length, persisted: store.list().find(s => s.key === key)?.persisted ?? false },
+        details: { found: true, key, valueLength: length, persisted },
       };
+    },
+    // Custom rendering — never display the actual secret value in the TUI
+    renderCall(args, theme, _context) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("get_secret ")) +
+        theme.fg("accent", args.key),
+        0, 0
+      );
+    },
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as
+        | { found: boolean; key: string; valueLength?: number }
+        | undefined;
+
+      if (!details?.found) {
+        return new Text(
+          theme.fg("warning", `⚠ Secret "${details?.key ?? "?"}" not found`),
+          0, 0
+        );
+      }
+
+      // Show only metadata — mask the actual value from the TUI
+      const lengthHint = ` (${details.valueLength} chars)`;
+      const preview = "•".repeat(Math.min(details.valueLength ?? 0, 16));
+      return new Text(
+        theme.fg("success", "✓ ") +
+        theme.fg("accent", details.key) +
+        theme.fg("muted", lengthHint) +
+        " " +
+        theme.fg("dim", preview) +
+        "   " +
+        theme.fg("muted", "→ cached for with_secret"),
+        0, 0
+      );
+    },
+  });
+
+  // ===========================================================================
+  // Tool: with_secret
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "with_secret",
+    label: "With Secret",
+    description:
+      "Run a shell command with a previously retrieved secret injected as an " +
+      "environment variable. The secret must have been retrieved first via " +
+      "get_secret (which caches it in memory). The secret value is NEVER " +
+      "exposed in tool result content, session history, TUI display, or bash " +
+      "history — it's injected directly into the subprocess environment.\n" +
+      "\n" +
+      "The secret is available as \\$SECRET inside the command by default. " +
+      "Use envVarName to pick a different variable name.\n" +
+      "\n" +
+      "After completion, the secret is consumed (removed from the in-memory " +
+      "cache). Re-run get_secret if you need it again.",
+    promptSnippet: "Run a command with a cached secret injected as $SECRET env var",
+    promptGuidelines: [
+      "Use with_secret after get_secret to use a secret in a command without leaking it into conversation history or bash history.",
+      "The secret is available as $SECRET inside the command by default. Set envVarName to change the variable name.",
+      "The secret is consumed after one use. Call get_secret again if you need it again.",
+    ],
+    parameters: Type.Object({
+      key: Type.String({
+        description:
+          "The key of the secret to use. Must have been retrieved via get_secret first " +
+          "(get_secret caches the value in memory for this tool).",
+      }),
+      command: Type.String({
+        description:
+          "The shell command to run. Reference the secret via \\$SECRET (or the name you " +
+          "specify in envVarName). Example: 'curl -H \"Authorization: Bearer $SECRET\" https://api.example.com'",
+      }),
+      envVarName: Type.Optional(
+        Type.String({
+          description:
+            "Environment variable name to inject the secret into (default: SECRET). " +
+            "Choose a descriptive name for clarity.",
+        })
+      ),
+      timeout: Type.Optional(
+        Type.Number({
+          description:
+            "Timeout in milliseconds for the command (default: 60000).",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const { key, command, envVarName, timeout } = params;
+
+      // --- Look up the cached secret ---
+      const secret = secretCache.get(key);
+      if (secret === undefined) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Secret "${key}" is not in the in-memory cache. Call get_secret(key="${key}") first to retrieve and cache it.`,
+            },
+          ],
+          details: { executed: false, key, reason: "not_cached" },
+        };
+      }
+
+      // --- Inject as env var and run ---
+      // Uses Node child_process.exec with custom env so the secret is injected
+      // directly into the subprocess environment. It never appears in:
+      //   - tool result content (no secret in session history)
+      //   - command line args (no secret in bash history or /proc)
+      //   - TUI display (renderResult masks everything)
+      const varName = envVarName || "SECRET";
+      const cwd = ctx.cwd;
+
+      // Truncation limits
+      const maxBytes = 50 * 1024;
+      const maxLines = 2000;
+
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          cwd,
+          env: { ...process.env, [varName]: secret },
+          timeout: timeout ?? 60_000,
+          maxBuffer: maxBytes,
+          signal,
+        });
+
+        // Apply truncation
+        const lines = stdout.split("\n");
+        const truncated = lines.length > maxLines || stdout.length > maxBytes;
+        const output = truncated
+          ? lines.slice(0, maxLines).join("\n") +
+            `\n\n[Output truncated: ${Math.min(lines.length, maxLines)} of ${lines.length} lines]`
+          : stdout;
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: output,
+            },
+          ],
+          details: {
+            executed: true,
+            key,
+            envVar: varName,
+            exitCode: 0,
+            stderr,
+            truncated,
+          },
+        };
+      } catch (e: any) {
+        // exec throws on non-zero exit or timeout — extract what we can
+        const exitCode = e.code ?? (e.killed ? -1 : 1);
+        const stderr = e.stderr ?? "";
+        const stdout = e.stdout ?? "";
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: stdout || stderr || `Command failed (exit ${exitCode})`,
+            },
+          ],
+          details: {
+            executed: true,
+            key,
+            envVar: varName,
+            exitCode,
+            stderr,
+          },
+        };
+      } finally {
+        // Consume the cached secret after use — one-shot cache
+        secretCache.delete(key);
+      }
+    },
+    // RenderCall — show the command but not the secret
+    renderCall(args, theme, _context) {
+      const varName = args.envVarName || "SECRET";
+      return new Text(
+        theme.fg("toolTitle", theme.bold("with_secret ")) +
+        theme.fg("accent", args.key) +
+        theme.fg("muted", ` → \$${varName} `) +
+        theme.fg("dim", args.command.slice(0, 80)),
+        0, 0
+      );
+    },
+    // RenderResult — show exit status
+    renderResult(result, _options, theme, _context) {
+      const details = result.details as
+        | { executed: boolean; key: string; exitCode?: number; reason?: string }
+        | undefined;
+
+      if (!details?.executed) {
+        return new Text(
+          theme.fg("warning", `⚠ with_secret: ${details?.reason ?? "failed"}`),
+          0, 0
+        );
+      }
+
+      const code = details.exitCode ?? 0;
+      const status = code === 0
+        ? theme.fg("success", `✓ `)
+        : theme.fg("error", `✗ (exit ${code}) `);
+
+      return new Text(
+        status +
+        theme.fg("accent", details.key) +
+        theme.fg("muted", " consumed"),
+        0, 0
+      );
     },
   });
 
