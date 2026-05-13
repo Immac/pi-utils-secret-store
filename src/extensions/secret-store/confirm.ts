@@ -7,7 +7,6 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, Container } from "@earendil-works/pi-tui";
 import { matchesKey, Key } from "@earendil-works/pi-tui";
 
 // =============================================================================

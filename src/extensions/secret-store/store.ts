@@ -271,14 +271,17 @@ export class SecretStore {
     const hadEphemeral = this.ephemeral.delete(key);
     const hadCached = this.cache.delete(key);
     if (hadCached || hadEphemeral) {
-      this.dirty = true;
-      // Also remove from backend
+      // Only mark not-dirty if the cache is now empty — otherwise other
+      // unflushed entries still need a flush.
+      if (this.cache.size === 0) {
+        this.dirty = false;
+      }
+      // Also remove from backend (safe to call even if key wasn't persisted)
       try {
         await this.backend.delete(key);
       } catch {
         // Ignore backend errors on delete
       }
-      this.dirty = false; // backend was updated directly
       return true;
     }
     return false;
