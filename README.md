@@ -4,233 +4,186 @@
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Pi Extension](https://img.shields.io/badge/pi-extension-orange?style=flat-square)](https://github.com/earendil-works/pi-coding-agent)
 
-**Safe secret management for pi agents** — prompt users for secrets (passwords, API keys, tokens), store them securely with optional persistence, and retrieve them on demand. Secrets matching sensitive patterns (sudo, password, root, etc.) are NEVER persisted to disk by default.
+**LLM-safe secret management for pi agents.** A tool UX layer on top of PI's built-in `AuthStorage` (`~/.pi/agent/auth.json`) that lets the LLM securely prompt for, retrieve, list, and manage secrets — without leaking them into conversation history.
+
+---
+
+## Motivation
+
+PI already has a credential store (`AuthStorage` at `~/.pi/agent/auth.json`). It supports:
+
+- API key persistence with `0600` perms
+- Shell command resolution (`!pass show ...`, `!op read ...`)
+- Runtime overrides (`setRuntimeApiKey`)
+- OAuth tokens via `/login`
+
+But `AuthStorage` is a **developer API** — the LLM can't call it directly. If the LLM needs a password, it has no way to ask you for one, or to use it without the value ending up visible in tool results, session history, and compaction summaries.
+
+**This extension bridges that gap.** It wraps `AuthStorage` with LLM-callable tools that enforce safe handling of secrets:
+
+- 🗣️ **Ask** via TUI dialog (paste-friendly `ctx.ui.input()`)
+- 🔒 **Retrieve** without leaking to `content` (two-step `get_secret` → `with_secret`)
+- 🚫 **Blocklist** prevents accidental persistence of sensitive key patterns
+- 🔐 **Env-var injection** runs commands with the secret without it appearing on the command line or in bash history
 
 ---
 
 ## Features
 
-| Feature | Tool / Command | What It Does |
-|---------|---------------|-------------|
-| 🆕 **Ask for a Secret** | `ask_secret` | Prompts the user via TUI dialog, stores the value securely |
-| 🔍 **Retrieve a Secret** | `get_secret` | Returns a stored secret value to the LLM |
-| 📋 **List Secrets** | `list_secrets` | Shows stored secret keys (without values) + persistence status |
-| 🗑️ **Clear a Secret** | `clear_secret` | Deletes a single secret from both disk and memory |
-| 🧹 **Forget All** | `forget_secrets` | Clears ALL secrets from disk and memory |
-| 📁 **Store Path** | `get_secret_store_path` | Shows the location of the secrets JSON file |
-| 🔐 **Status Line** | _(auto)_ | Shows `🔐 N secret(s)` in the footer when secrets exist |
-| 📟 **List Command** | `/secrets` | Interactive command to list stored secrets |
-| 📟 **Path Command** | `/secret-path` | Interactive command to show the store file path |
+| Tool | What It Does |
+|------|-------------|
+| `ask_secret` | Prompts the user via TUI dialog, stores in `AuthStorage` |
+| `get_secret` | Retrieves metadata (key, length) — value cached in memory, **never in `content`** |
+| `with_secret` | Runs a shell command with the secret injected as `$SECRET` env var — **never in `content`, session, or bash history** |
+| `list_secrets` | Lists stored keys + persistence status |
+| `clear_secret` | Deletes one secret (requires typed confirmation) |
+| `forget_secrets` | Wipes ALL secrets (requires typed mantra) |
+| `get_secret_store_path` | Shows `~/.pi/agent/auth.json` |
 
-### Security Features
+### Why this exists
 
-- **Safe JSON Store** — secrets persisted to `~/.pi/agent/secrets.json` with `0600` permissions
-- **Do-Not-Persist List** — secrets with keys matching sensitive patterns are kept **in-memory only**
-- **Default Protection** — `sudo`, `password`, `passwd`, `root`, `admin`, `token`, and related patterns are **never written to disk** — full stop
-- **Absolute Blocklist** — the blocklist CANNOT be overridden. Blocked keys are NEVER persisted regardless of the `persist` parameter
-
-### Default Do-Not-Persist Patterns
-
-The following keys (and any key containing these as substrings, case-insensitive) are never persisted:
-
-`sudo`, `password`, `passwd`, `pass`, `root`, `admin`, `root_password`, `sudo_password`, `admin_password`, `db_password`, `database_password`, `pgpass`, `mysql_password`, `ssh_key`, `ssh_key_passphrase`, `token`, `access_token`, `secret_token`, `api_secret`
+| Problem | Without extension | With extension |
+|---------|-----------------|----------------|
+| LLM needs a credential you haven't given it | LLM asks in text, you copy-paste into chat | LLM calls `ask_secret`, TUI dialog appears |
+| LLM retrieves a stored key | Value goes in tool `content` → session history → compaction | `get_secret` returns only metadata, `with_secret` injects as env var |
+| LLM runs a command with a secret | The command appears in tool args, may leak via `ps` | `with_secret` spawns subprocess with secret in env, never on command line |
+| You want to know what's stored | Edit JSON files manually | `list_secrets` |
+| Secret rotation | Edit JSON files manually | `clear_secret` → `ask_secret` |
 
 ---
 
 ## Quick Start
 
-### For Users
-
 ```bash
-# From the repository location
 pi install /path/to/secret-store
-
-# Or symlink for development
-ln -s /path/to/secret-store ~/.pi/agent/packages/secret-store
 ```
 
-Then reload pi (`/reload`) and the tools are available to the LLM.
+Then `/reload` and the tools are available to the LLM.
 
-### For LLM (Agent) Usage
+### LLM Workflow
 
-The LLM calls these tools automatically when it needs credentials. Here's the typical flow:
-
-1. **Agent needs a credential** → calls `ask_secret(key: "github_token", prompt: "Enter your GitHub personal access token:")`
-2. **TUI dialog appears** → user types the secret
-3. **Secret is stored** → in memory (and optionally persisted to disk)
-4. **Agent uses the secret** → calls `get_secret(key: "github_token")` to retrieve it
-5. **Done with the secret** → calls `clear_secret(key: "github_token")` to remove it
-
-### Example Prompts (what users say to the LLM)
-
-> "Deploy to production using my GitHub token"
-
-LLM → asks for the token via `ask_secret`, retrieves it with `get_secret`, uses it.
-
-> "What secrets do I have stored?"
-
-LLM → calls `list_secrets` to enumerate stored keys.
-
-> "Clear all my stored credentials"
-
-LLM → calls `forget_secrets` to wipe the store.
-
----
-
-## Tool API Reference
-
-### `ask_secret`
-
-Prompt the user for a secret and store it securely.
-
-```typescript
-interface AskSecretParams {
-  key: string;           // Identifier (e.g., "github_token", "database_password", "sudo")
-  prompt: string;        // Message shown in the TUI dialog
-  persist?: boolean;     // Override persistence behavior (optional)
-}
 ```
+User: "Set up the database with my credentials"
 
-**Persistence logic:**
-- The blocklist is **absolute** — blocked keys are NEVER persisted regardless of `persist`
-- `persist` not set (default) → blocked keys go to memory, non-blocked keys go to disk
-- `persist: false` → keep a non-blocked key in memory only (no effect on blocked keys)
-- `persist: true` → same as default (only affects non-blocked keys; blocked keys are still blocked)
+LLM:  ask_secret(key="db_password", prompt="Enter DB password:")
+  →  TUI dialog → user pastes password → "Secret 'db_password' stored"
 
-### `get_secret`
+LLM:  get_secret(key="db_password")
+  →  "Secret 'db_password' (12 chars) retrieved. Use with_secret to use it."
 
-Retrieve a stored secret by key.
-
-```typescript
-interface GetSecretParams {
-  key: string;  // Secret identifier
-}
-```
-
-Returns the full secret value if found, or a "not found" message.
-
-### `list_secrets`
-
-List all stored secret keys without revealing values.
-
-```typescript
-// No parameters
-```
-
-Returns a formatted list with persistence indicators (💾 persisted, 🧠 session-only).
-
-### `clear_secret`
-
-Delete a single secret.
-
-```typescript
-interface ClearSecretParams {
-  key: string;  // Secret identifier to remove
-}
-```
-
-### `forget_secrets`
-
-Clear ALL secrets from disk and memory.
-
-```typescript
-// No parameters
-```
-
-### `get_secret_store_path`
-
-Get the filesystem path of the secret store JSON file.
-
-```typescript
-// No parameters
+LLM:  with_secret(key="db_password", command="mysql -u root -p$SECRET < schema.sql")
+  →  Secret injected as env var, never in content. Output returned.
 ```
 
 ---
 
-## Commands
+## How It Works
 
-| Command | Description |
-|---------|-------------|
-| `/secrets` | List all stored secret keys (without values) |
-| `/secret-path` | Show the secret store file path |
+```
+LLM → tool call
+        │
+  ┌─────┴─────┐
+  │ ask_secret │  ctx.ui.input() → TUI dialog → user enters value
+  └─────┬─────┘
+        │
+        ▼
+  ┌──────────────┐
+  │  AuthStorage  │  ~/.pi/agent/auth.json (0600)
+  │              │    or setRuntimeApiKey() for blocked/ephemeral
+  └──────┬───────┘
+         │
+         ▼
+  get_secret → returns metadata only, value cached in memory
+  with_secret → looks up cached value, injects as $SECRET env var
+                spawns via child_process.exec — never on command line
+```
+
+### Integration with PI's AuthStorage
+
+The extension uses `AuthStorage` from `@earendil-works/pi-coding-agent`:
+
+| `AuthStorage` method | Used by |
+|---------------------|---------|
+| `set(key, credential)` | `ask_secret` (persisted secrets) |
+| `setRuntimeApiKey(key, value)` | `ask_secret` (blocked/ephemeral secrets) |
+| `getApiKey(key)` | `get_secret`, `with_secret` (resolves `!commands`) |
+| `has(key)` | `get_secret`, `with_secret`, `clear_secret` |
+| `list()` | `list_secrets`, `forget_secrets` |
+| `remove(key)` | `clear_secret`, `forget_secrets` |
+| `reload()` | `session_start` |
+
+### Supported value formats in `auth.json`
+
+```json
+{
+  "github_token": { "type": "api_key", "key": "ghp_abc123" },
+  "db_password":  { "type": "api_key", "key": "!pass show db/prod" },
+  "aws_key":      { "type": "api_key", "key": "AWS_SECRET_ACCESS_KEY" }
+}
+```
+
+| Format | Example | Resolution |
+|--------|---------|-----------|
+| Literal | `"sk-abc..."` | Used directly |
+| Env var | `"MY_API_KEY"` | Read from environment |
+| Command | `"!pass show api/key"` | Executed, stdout captured |
+
+The `!command` syntax lets you wire in `pass`, `1password-cli`, `security`, or any secret manager without the extension needing to know about it.
+
+---
+
+## Security Model
+
+### Two-step retrieval (get_secret → with_secret)
+
+```
+  get_secret("db_password")
+    → value cached in memory Map
+    → content: "Secret 'db_password' (12 chars) retrieved. Use with_secret..."
+    →  ✓ session file has no value
+    →  ✓ compaction has no value
+
+  with_secret(key="db_password", command="mysql -u root -p$SECRET")
+    → looks up Map["db_password"]
+    → child_process.exec with env: { SECRET: "actual-value" }
+    → command references env var name, not the value
+    →  ✓ no secret in tool content
+    →  ✓ no secret in session file
+    →  ✓ no secret in bash history (non-interactive shell)
+    →  ✓ no secret in /proc/*/cmdline (env only, not args)
+    →  ⬜ brief exposure in /proc/*/environ (process lifetime)
+```
+
+### Blocklist
+
+Keys matching these patterns (case-insensitive substring match) are **never persisted** — stored only as runtime overrides via `setRuntimeApiKey`:
+
+`sudo`, `password`, `passwd`, `pass`, `root`, `admin`, `token`, `ssh_key`, `api_secret`, and variants.
+
+### Confirmation dialogs
+
+- `clear_secret` → must type the secret name to confirm
+- `forget_secrets` → must type a random affirmation phrase
 
 ---
 
 ## Development
 
 ```bash
-# Validate TypeScript
-npm run validate
-
-# Run tests
-npm test
-
-# Run all
-npm test && npm run validate
+npm run validate    # tsc --noEmit --skipLibCheck
 ```
 
 ### Project Structure
 
 ```
 secret-store/
-├── package.json                              # pi.extensions entrypoint
+├── package.json
 ├── tsconfig.json
-├── .gitignore
 ├── src/extensions/secret-store/
-│   ├── secret-store.ts                       # Main extension: tools, commands, lifecycle
-│   └── store.ts                              # SecretStore class (CRUD, persistence, blocklist)
-├── test/
-│   └── secret-store.test.ts                  # 28+ tests covering CRUD, blocklist, persistence, edge cases
+│   ├── secret-store.ts    # Extension entry: tools, lifecycle, commands
+│   └── confirm.ts         # Confirmation dialog helper
 └── README.md
 ```
-
----
-
-## Architecture
-
-```
-LLM calls ask_secret("github_token", "Enter token:")
-            │
-            ▼
-    secret-store extension
-            │
-    ┌───────┴───────┐
-    │  ctx.ui.input() │  ← Prompts user via TUI dialog
-    └───────┬───────┘
-            │
-            ▼
-    SecretStore.set(key, value, persist?)
-            │
-    ┌───────┴─────────────────┐
-    │                         │
-    ▼                         ▼
-  In-Memory Map            ~/.pi/agent/secrets.json
-  (ephemeral)               (0600 permissions)
-                            (blocked keys filtered out)
-```
-
-The `SecretStore` class is the core engine. It maintains two separate Maps:
-- **`persisted`** — keys that survive restarts (written to `secrets.json`)
-- **`ephemeral`** — keys that live only for the current session
-
-On `session_start`, the store loads from disk. On `session_shutdown`, it saves. Between those events, the store is the single source of truth.
-
----
-
-## Security Notes
-
-- The secrets JSON file uses **0600 permissions** (owner read/write only)
-- The directory `~/.pi/agent/` is created with **0700 permissions** if it doesn't exist
-- Secrets are never logged or included in error messages
-- The `list_secrets` tool reveals **keys only**, never values
-- The `ask_secret` return value shows a sanitized preview (first 2 + last 2 chars) — never the full value
-- The blocklist is **case-insensitive** and uses substring matching for broad coverage
-
-**⚠️ Limitations:**
-- The JSON file is **not encrypted at rest** — it relies on filesystem permissions (0600)
-- For production use, consider encrypting the store or using a dedicated secret manager
-- In interactive mode, the `ask_secret` tool uses a **masked custom TUI component** (`PasswordInput`) — all typed characters display as `•` so the secret is never visible on screen
-- In non-interactive mode (print/JSON), `ask_secret` falls back to `ctx.ui.input()` which does not mask
 
 ---
 
