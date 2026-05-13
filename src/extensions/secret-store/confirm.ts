@@ -29,20 +29,58 @@ class ConfirmInput {
     this.expected = expected;
   }
 
+  /** Split a line into word-wrapped chunks at max width */
+  private wrap(line: string, width: number): string[] {
+    if (line.length <= width) return [line];
+    const result: string[] = [];
+    const words = line.split(" ");
+    let current = "";
+    for (const word of words) {
+      if ((current + " " + word).trim().length <= width) {
+        current = (current + " " + word).trim();
+      } else {
+        if (current) result.push(current);
+        current = word;
+      }
+    }
+    if (current) result.push(current);
+    return result;
+  }
+
   render(width: number): string[] {
     const lines: string[] = [];
-    // Blank line for spacing
+
+    // Top blank line
     lines.push(" ".repeat(width));
-    // Prompt line
-    lines.push(" " + this.prompt);
+
+    // Prompt — split on \n and word-wrap each paragraph
+    const paragraphs = this.prompt.split("\n");
+    for (const para of paragraphs) {
+      if (para === "") {
+        lines.push("");
+      } else {
+        const wrapped = this.wrap("  " + para, width);
+        for (const w of wrapped) {
+          lines.push(w.length < width ? w + " ".repeat(width - w.length) : w);
+        }
+      }
+    }
+
+    // Blank line before input
+    lines.push(" ".repeat(width));
+
     // Input line with cursor indicator
     const display = "> " + this.value + (this.value.length < this.expected.length ? "▊" : " ");
-    lines.push(display.length < width ? display + " ".repeat(width - display.length) : display.slice(0, width));
+    const displayLine = display.length < width ? display + " ".repeat(width - display.length) : display.slice(0, width);
+    lines.push(displayLine);
+
     // Hint line
-    const hint = `  (type the secret name above to confirm)`;
+    const hint = `  (type the text above exactly to confirm)`;
     lines.push(hint.length < width ? hint + " ".repeat(width - hint.length) : hint.slice(0, width));
-    // Blank line
+
+    // Bottom blank line
     lines.push(" ".repeat(width));
+
     return lines;
   }
 
