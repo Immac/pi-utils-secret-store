@@ -201,11 +201,32 @@ secret-store/
 
 ---
 
+## 🔌 Companion Extension: Credential Guard
+
+Pair Secret Store with [Credential Guard](https://github.com/Immac/pi-utils-credential-guard) to block reading of credential files at the tool level:
+
+```
+read(path="~/.aws/credentials")
+  └─ credential-guard blocks
+       └─ "Use import_secret to import this file"
+            └─ import_secret(path="~/.aws/credentials")
+                 └─ parsed → stored → optionally deleted
+                      └─ get_secret / with_secret
+```
+
+| Installed | Behavior |
+|---|---|
+| Secret Store only | All tools work, but `read` can still leak credentials |
+| Credential Guard only | In-memory fallback tools, no persistence |
+| **Both** | Full protection: read blocked + persistent secret store |
+
+---
+
 ## 📖 Resources
 
 - [Pi Extension Docs](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/extensions.md)
 - [AuthStorage API](https://github.com/earendil-works/pi-coding-agent)
-- [Credential Guard](https://github.com/Immac/pi-utils-credential-guard) — companion extension that blocks reading of credential files
+- [Credential Guard](https://github.com/Immac/pi-utils-credential-guard) — blocks reading of credential files
 
 ---
 
