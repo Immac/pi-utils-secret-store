@@ -8,9 +8,48 @@
  * - .env (KEY=VALUE with # comments)
  * - .json (flat objects with string values)
  * - INI-like ([sections], key=value, # and ; comments)
+ * - Custom regex templates for non-standard formats
  */
 
 import { basename, dirname, resolve } from "node:path";
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/**
+ * A custom template for parsing non-standard credential file formats.
+ *
+ * Uses a regex with named capture groups to extract key-value pairs.
+ *
+ * @example
+ * ```ts
+ * {
+ *   name: "netrc-like",
+ *   description: "netrc-style machine/login/password",
+ *   pattern: "^machine\\s+(?<key>\\S+)\\s*\\n\\s+login\\s+(?<login>\\S+)\\s*\\n\\s+password\\s+(?<value>\\S+)"",
+ *   flags: "gm",
+ *   keyGroup: "key",
+ *   valueGroup: "value"
+ * }
+ * ```
+ */
+export interface CredentialTemplate {
+  name: string;
+  description: string;
+  /** Regex pattern with named capture groups */
+  pattern: string;
+  /** Regex flags (default: "gm") */
+  flags?: string;
+  /** Named group for the credential key (default: "key") */
+  keyGroup?: string;
+  /** Named group for the credential value (default: "value") */
+  valueGroup?: string;
+  /** Optional file glob pattern for auto-detection */
+  filePattern?: string;
+  /** Optional regex for lines to skip before matching */
+  skipPattern?: string;
+}
 
 // =============================================================================
 // Format detection
@@ -178,4 +217,65 @@ export function deriveNamespace(filePath: string): string {
   // Strip leading dot from hidden directories (.aws → aws)
   if (name.startsWith(".")) name = name.slice(1);
   return name;
+}
+
+// =============================================================================
+// Custom template parser
+// =============================================================================
+
+/**
+ * Parse credential file content using a custom regex template.
+ *
+ * The template's pattern is applied globally across the content.
+ * Each match extracts the credential key (from `keyGroup`, default "key")
+ * and value (from `valueGroup`, default "value") from named capture groups.
+ *
+ * Optionally skips lines matching `skipPattern` before matching.
+ */
+export function parseWithTemplate(
+  content: string,
+  template: CredentialTemplate
+): Array<{ key: string; value: string }> {
+  const result: Array<{ key: string; value: string }> = [];
+
+  // Apply skip filter if provided
+  let text = content;
+  if (template.skipPattern) {
+    try {
+      const skipRe = new RegExp(template.skipPattern, "gm");
+      text = text.replace(skipRe, "");
+    } catch {
+      // Invalid skip pattern — proceed without filtering
+    }
+  }
+
+  const flags = template.flags ?? "gm";
+  const keyGroup = template.keyGroup ?? "key";
+  const valueGroup = template.valueGroup ?? "value";
+
+  try {
+    const re = new RegExp(template.pattern, flags);
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      const groups = match.groups ?? {};
+      const key = (groups[keyGroup] ?? "").trim();
+      let value = (groups[valueGroup] ?? "").trim();
+      if (!key) continue;
+      // Strip surrounding quotes
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      result.push({ key, value });
+
+      // Avoid infinite loop on zero-length matches
+      if (match.index === re.lastIndex) re.lastIndex++;
+    }
+  } catch {
+    // Invalid regex — return empty
+  }
+
+  return result;
 }

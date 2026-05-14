@@ -23,19 +23,22 @@
 
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
-import { resolve } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { confirmDestructiveAction } from "./confirm.js";
 import {
   detectFormat,
   parseEnv,
   parseJson,
   parseIni,
+  parseWithTemplate,
   deriveNamespace,
+  type CredentialTemplate,
 } from "./import-parsers.js";
 
 const execAsync = promisify(execCb);
@@ -810,6 +813,233 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ===========================================================================
+  // Template persistence
+  // ===========================================================================
+
+  /** Path to stored custom templates */
+  const TEMPLATES_PATH = join(getAgentDir(), "secret-import-templates.json");
+
+  /** Load templates from disk */
+  function loadTemplates(): CredentialTemplate[] {
+    try {
+      const raw = readFileSync(TEMPLATES_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Save templates to disk */
+  function saveTemplates(templates: CredentialTemplate[]): void {
+    mkdirSync(dirname(TEMPLATES_PATH), { recursive: true });
+    writeFileSync(TEMPLATES_PATH, JSON.stringify(templates, null, 2), "utf-8");
+  }
+
+  /** Find a template by name (case-insensitive) */
+  function findTemplate(name: string): CredentialTemplate | undefined {
+    return loadTemplates().find(
+      (t) => t.name.toLowerCase() === name.toLowerCase()
+    );
+  }
+
+  // ===========================================================================
+  // Tool: import_secret_template_add
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "import_secret_template_add",
+    label: "Add Import Template",
+    description:
+      "Register a custom regex template for parsing non-standard credential file formats. " +
+      "The template defines a regex with named capture groups to extract key-value pairs. " +
+      "Use (?<key>...) for the credential name and (?<value>...) for the secret value. " +
+      "Once registered, the template can be referenced by name in import_secret.",
+    promptSnippet: "Register a custom regex template for parsing credential files",
+    promptGuidelines: [
+      "Use import_secret_template_add when a credential file doesn't match .env, JSON, or INI formats.",
+      "The pattern must include (?<key>...) and (?<value>...) named capture groups.",
+      "After adding a template, use import_secret with the template name to parse matching files.",
+    ],
+    parameters: Type.Object({
+      name: Type.String({ description: "Unique name for this template" }),
+      description: Type.String({ description: "Human-readable description of what this template matches" }),
+      pattern: Type.String({
+        description:
+          "Regex pattern with named capture groups. " +
+          "Use (?<key>...) for the credential identifier and (?<value>...) for the secret value. " +
+          "Additional named groups are ignored.",
+      }),
+      flags: Type.Optional(
+        Type.String({ description: "Regex flags (default: 'gm'). Common: 'g' (global), 'm' (multiline), 'i' (case-insensitive)." })
+      ),
+      keyGroup: Type.Optional(
+        Type.String({ description: "Name of the named capture group for the credential key (default: 'key')." })
+      ),
+      valueGroup: Type.Optional(
+        Type.String({ description: "Name of the named capture group for the credential value (default: 'value')." })
+      ),
+      filePattern: Type.Optional(
+        Type.String({ description: "Optional file glob pattern for auto-detection (e.g., '*.cfg', '*.netrc')." })
+      ),
+      skipPattern: Type.Optional(
+        Type.String({ description: "Optional regex for lines to skip before matching (e.g., '^#|^;' to skip comments)." })
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const templates = loadTemplates();
+
+      // Check for duplicate name
+      if (templates.some((t) => t.name.toLowerCase() === params.name.toLowerCase())) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Template "${params.name}" already exists. Use import_secret_template_remove first, or choose a different name.`,
+            },
+          ],
+          details: { added: false, name: params.name, reason: "duplicate" },
+        };
+      }
+
+      // Validate the pattern compiles
+      try {
+        new RegExp(params.pattern, params.flags ?? "gm");
+      } catch (e: any) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid regex pattern: ${e.message}`,
+            },
+          ],
+          details: { added: false, name: params.name, reason: "invalid_pattern", error: e.message },
+        };
+      }
+
+      const template: CredentialTemplate = {
+        name: params.name,
+        description: params.description,
+        pattern: params.pattern,
+        flags: params.flags ?? "gm",
+        keyGroup: params.keyGroup ?? "key",
+        valueGroup: params.valueGroup ?? "value",
+        filePattern: params.filePattern,
+        skipPattern: params.skipPattern,
+      };
+
+      templates.push(template);
+      saveTemplates(templates);
+
+      ctx.ui.notify(`Template "${params.name}" added`, "info");
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Template "${params.name}" registered successfully.` +
+              `\nPattern: ${params.pattern}` +
+              `\nFlags: ${params.flags ?? "gm"}` +
+              (params.filePattern ? `\nAuto-detect: files matching ${params.filePattern}` : "") +
+              `\n\nUse import_secret(path="...", template="${params.name}") to parse files with this template.`,
+          },
+        ],
+        details: { added: true, name: params.name },
+      };
+    },
+  });
+
+  // ===========================================================================
+  // Tool: import_secret_template_list
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "import_secret_template_list",
+    label: "List Import Templates",
+    description: "List all registered custom import templates with their descriptions and patterns.",
+    promptSnippet: "List registered credential import templates",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+      const templates = loadTemplates();
+
+      if (templates.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No custom templates registered. Use import_secret_template_add to create one." }],
+          details: { count: 0, templates: [] },
+        };
+      }
+
+      const lines = templates.map(
+        (t) =>
+          `  • ${t.name}: ${t.description}` +
+          (t.filePattern ? ` (auto: ${t.filePattern})` : "")
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `**${templates.length} custom template(s) registered:**\n\n${lines.join("\n")}` +
+              `\n\nUse import_secret(path="...", template="<name>") to parse files with a specific template.`,
+          },
+        ],
+        details: {
+          count: templates.length,
+          templates: templates.map((t) => ({
+            name: t.name,
+            description: t.description,
+            filePattern: t.filePattern,
+          })),
+        },
+      };
+    },
+  });
+
+  // ===========================================================================
+  // Tool: import_secret_template_remove
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "import_secret_template_remove",
+    label: "Remove Import Template",
+    description: "Remove a previously registered custom import template by name.",
+    promptSnippet: "Remove a registered credential import template",
+    parameters: Type.Object({
+      name: Type.String({ description: "Name of the template to remove" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const templates = loadTemplates();
+      const idx = templates.findIndex(
+        (t) => t.name.toLowerCase() === params.name.toLowerCase()
+      );
+
+      if (idx === -1) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `No template found with name "${params.name}". Use import_secret_template_list to see available templates.`,
+            },
+          ],
+          details: { removed: false, name: params.name },
+        };
+      }
+
+      const removed = templates.splice(idx, 1);
+      saveTemplates(templates);
+
+      ctx.ui.notify(`Template "${params.name}" removed`, "info");
+
+      return {
+        content: [{ type: "text" as const, text: `Template "${params.name}" has been removed.` }],
+        details: { removed: true, name: params.name },
+      };
+    },
+  });
+
+  // ===========================================================================
   // Tool: import_secret
   // ===========================================================================
 
@@ -819,6 +1049,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Import credentials from a local file into the secret store. " +
       "Supports .env, JSON, and INI-like formats (e.g., ~/.aws/credentials). " +
+      "For non-standard formats, provide a template name (registered via import_secret_template_add) " +
+      "or an inline template object. " +
       "Values are stored under namespace:key derived from the file path. " +
       "The source file can optionally be deleted after import.",
     promptSnippet: "Import credentials from a file into the secret store",
@@ -831,9 +1063,40 @@ export default function (pi: ExtensionAPI) {
         description:
           "Path to the credential file. Supported formats: .env, .json, or INI-like (.aws/credentials, etc.).",
       }),
+      template: Type.Optional(
+        Type.Union([
+          Type.String({
+            description:
+              "Name of a registered template (added via import_secret_template_add). " +
+              "The template's regex pattern is used to extract key-value pairs.",
+          }),
+          Type.Object({
+            pattern: Type.String({
+              description:
+                "Regex pattern with named capture groups. " +
+                "Use (?<key>...) for the credential identifier and (?<value>...) for the secret value.",
+            }),
+            description: Type.Optional(
+              Type.String({ description: "Optional description for inline templates." })
+            ),
+            flags: Type.Optional(
+              Type.String({ description: "Regex flags (default: 'gm')." })
+            ),
+            keyGroup: Type.Optional(
+              Type.String({ description: "Named capture group for the key (default: 'key')." })
+            ),
+            valueGroup: Type.Optional(
+              Type.String({ description: "Named capture group for the value (default: 'value')." })
+            ),
+            skipPattern: Type.Optional(
+              Type.String({ description: "Regex for lines to skip before matching." })
+            ),
+          }),
+        ])
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { path: filePath } = params;
+      const { path: filePath, template: templateParam } = params;
       const absolutePath = resolve(ctx.cwd, filePath);
 
       // --- Read the file ---
@@ -847,18 +1110,61 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // --- Parse by format ---
-      const format = detectFormat(absolutePath);
+      // --- Resolve template ---
+      let activeTemplate: CredentialTemplate | undefined;
+      let templateSource: string | undefined;
+
+      if (typeof templateParam === "string") {
+        // Named template — look up in registry
+        activeTemplate = findTemplate(templateParam);
+        templateSource = `template "${templateParam}"`;
+        if (!activeTemplate) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `No template found with name "${templateParam}". ` +
+                  `Use import_secret_template_list to see available templates, or provide an inline pattern.`,
+              },
+            ],
+            details: { imported: false, error: `template "${templateParam}" not found` },
+          };
+        }
+      } else if (templateParam && typeof templateParam === "object") {
+        // Inline template — use directly
+        activeTemplate = {
+          name: "(inline)",
+          description: templateParam.description ?? "Inline template",
+          pattern: templateParam.pattern,
+          flags: templateParam.flags ?? "gm",
+          keyGroup: templateParam.keyGroup ?? "key",
+          valueGroup: templateParam.valueGroup ?? "value",
+          skipPattern: templateParam.skipPattern,
+        };
+        templateSource = "inline template";
+      }
+
+      // --- Parse by format or template ---
+      let format: string;
       let parsed: Array<{ key: string; value: string }>;
-      switch (format) {
-        case "env":
-          parsed = parseEnv(content);
-          break;
-        case "json":
-          parsed = parseJson(content);
-          break;
-        default:
-          parsed = parseIni(content);
+
+      if (activeTemplate) {
+        format = `custom (${activeTemplate.name})`;
+        parsed = parseWithTemplate(content, activeTemplate);
+      } else {
+        const detected = detectFormat(absolutePath);
+        format = detected;
+        switch (detected) {
+          case "env":
+            parsed = parseEnv(content);
+            break;
+          case "json":
+            parsed = parseJson(content);
+            break;
+          default:
+            parsed = parseIni(content);
+        }
       }
 
       if (parsed.length === 0) {

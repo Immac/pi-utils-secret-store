@@ -15,7 +15,9 @@ import {
   parseEnv,
   parseJson,
   parseIni,
+  parseWithTemplate,
   deriveNamespace,
+  type CredentialTemplate,
 } from "../src/extensions/secret-store/import-parsers.js";
 
 // =============================================================================
@@ -276,6 +278,139 @@ async function testDeriveNamespace_tilde() {
 }
 
 // =============================================================================
+// parseWithTemplate
+// =============================================================================
+
+async function testParseWithTemplate_basic() {
+  const template: CredentialTemplate = {
+    name: "test",
+    description: "Simple key=value per line",
+    pattern: "^(?<key>\\w+)=(?<value>.+)$",
+    flags: "gm",
+  };
+  const result = parseWithTemplate("USER=admin\nPASS=secret123", template);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].key, "USER");
+  assert.equal(result[0].value, "admin");
+  assert.equal(result[1].key, "PASS");
+  assert.equal(result[1].value, "secret123");
+  console.log("  ✓ testParseWithTemplate_basic");
+}
+
+async function testParseWithTemplate_namedGroups() {
+  const template: CredentialTemplate = {
+    name: "custom-groups",
+    description: "Custom group names",
+    pattern: "^name=(?<k>[^,]+),secret=(?<v>.+)$",
+    flags: "gm",
+    keyGroup: "k",
+    valueGroup: "v",
+  };
+  const result = parseWithTemplate("name=db,secret=hunter2\nname=api,secret=xyz789", template);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].key, "db");
+  assert.equal(result[0].value, "hunter2");
+  assert.equal(result[1].key, "api");
+  assert.equal(result[1].value, "xyz789");
+  console.log("  ✓ testParseWithTemplate_namedGroups");
+}
+
+async function testParseWithTemplate_skipPattern() {
+  const template: CredentialTemplate = {
+    name: "skip-comments",
+    description: "Skip comment lines",
+    pattern: "^(?<key>\\w+)=(?<value>.+)$",
+    flags: "gm",
+    skipPattern: "^#.*",
+  };
+  const result = parseWithTemplate(
+    "# this is a comment\nAPI_KEY=sk-123\n# another comment\nDB_PASS=secret",
+    template
+  );
+  assert.equal(result.length, 2);
+  assert.equal(result[0].key, "API_KEY");
+  assert.equal(result[1].key, "DB_PASS");
+  console.log("  ✓ testParseWithTemplate_skipPattern");
+}
+
+async function testParseWithTemplate_multiline() {
+  const template: CredentialTemplate = {
+    name: "netrc-like",
+    description: "netrc machine/login/password",
+    pattern:
+      "^machine\\s+(?<key>\\S+)\\s*\\n" +
+      "\\s+login\\s+\\S+\\s*\\n" +
+      "\\s+password\\s+(?<value>\\S+)",
+    flags: "gm",
+  };
+  const result = parseWithTemplate(
+    "machine db.example.com\n  login admin\n  password s3cret\nmachine api.example.com\n  login user\n  password pass123",
+    template
+  );
+  assert.equal(result.length, 2);
+  assert.equal(result[0].key, "db.example.com");
+  assert.equal(result[0].value, "s3cret");
+  assert.equal(result[1].key, "api.example.com");
+  assert.equal(result[1].value, "pass123");
+  console.log("  ✓ testParseWithTemplate_multiline");
+}
+
+async function testParseWithTemplate_invalidPattern() {
+  const template: CredentialTemplate = {
+    name: "bad",
+    description: "Invalid regex",
+    pattern: "[invalid",
+    flags: "gm",
+  };
+  // Should not throw, return empty
+  const result = parseWithTemplate("foo=bar", template);
+  assert.equal(result.length, 0);
+  console.log("  ✓ testParseWithTemplate_invalidPattern");
+}
+
+async function testParseWithTemplate_noMatch() {
+  const template: CredentialTemplate = {
+    name: "nomatch",
+    description: "No matches",
+    pattern: "^(?<key>XXX)=(?<value>.*)$",
+    flags: "gm",
+  };
+  const result = parseWithTemplate("USER=admin\nPASS=secret", template);
+  assert.equal(result.length, 0);
+  console.log("  ✓ testParseWithTemplate_noMatch");
+}
+
+async function testParseWithTemplate_emptyContent() {
+  const template: CredentialTemplate = {
+    name: "empty",
+    description: "Empty content",
+    pattern: "^(?<key>\\w+)=(?<value>.+)$",
+    flags: "gm",
+  };
+  assert.equal(parseWithTemplate("", template).length, 0);
+  assert.equal(parseWithTemplate("  \n\n", template).length, 0);
+  console.log("  ✓ testParseWithTemplate_emptyContent");
+}
+
+async function testParseWithTemplate_quotedValues() {
+  const template: CredentialTemplate = {
+    name: "quoted",
+    description: "Quoted values",
+    pattern: "^(?<key>\\w+)=(?<value>.+)$",
+    flags: "gm",
+  };
+  const result = parseWithTemplate(
+    'NAME=My App\nPASS=plain\nSECRET=hidden',
+    template
+  );
+  assert.equal(result.length, 3);
+  assert.equal(result[0].value, "My App");
+  assert.equal(result[1].value, "plain");
+  assert.equal(result[2].value, "hidden");
+  console.log("  ✓ testParseWithTemplate_quotedValues");
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -314,6 +449,16 @@ async function main() {
   await testDeriveNamespace_project();
   await testDeriveNamespace_nested();
   await testDeriveNamespace_tilde();
+
+  // parseWithTemplate
+  await testParseWithTemplate_basic();
+  await testParseWithTemplate_namedGroups();
+  await testParseWithTemplate_skipPattern();
+  await testParseWithTemplate_multiline();
+  await testParseWithTemplate_invalidPattern();
+  await testParseWithTemplate_noMatch();
+  await testParseWithTemplate_emptyContent();
+  await testParseWithTemplate_quotedValues();
 
   console.log("\nAll import-parsers tests passed ✓");
 }
