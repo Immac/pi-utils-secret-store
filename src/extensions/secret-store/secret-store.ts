@@ -1154,10 +1154,13 @@ export default function (pi: ExtensionAPI) {
       // --- Parse by format or template ---
       let format: string;
       let parsed: Array<{ key: string; value: string }>;
+      let templateWarnings: string[] = [];
 
       if (activeTemplate) {
         format = `custom (${activeTemplate.name})`;
-        parsed = parseWithTemplate(content, activeTemplate);
+        const tmplResult = parseWithTemplate(content, activeTemplate);
+        parsed = tmplResult.entries;
+        templateWarnings = tmplResult.warnings;
       } else {
         const detected = detectFormat(absolutePath);
         format = detected;
@@ -1169,9 +1172,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (parsed.length === 0) {
+        const warningText = templateWarnings.length > 0
+          ? `\n\nWarnings from template:\n${templateWarnings.map((w) => `  • ${w}`).join("\n")}`
+          : "";
         return {
-          content: [{ type: "text" as const, text: `No credentials found in "${filePath}" (${format} format).` }],
-          details: { imported: false, format, found: 0 },
+          content: [{ type: "text" as const, text: `No credentials found in "${filePath}" (${format} format).${warningText}` }],
+          details: { imported: false, format, found: 0, templateWarnings },
         };
       }
 
@@ -1186,24 +1192,20 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const lines = result.keys.map((k) => `  • ${k}`).join("\n");
-      const note = result.deleted
-        ? ` Source file "${filePath}" has been deleted.`
-        : "";
+      let resultText =
+        `Imported ${result.stored} credential(s) from "${filePath}" into secret store.` +
+        `\nNamespace: ${namespace}` +
+        `\n\n${result.keys.map((k) => `  • ${k}`).join("\n")}` +
+        (result.deleted ? `\n\nSource file "${filePath}" has been deleted.` : "") +
+        `\n\nUse get_secret/with_secret to access these values.` +
+        (result.errors > 0 ? `\n\n⚠ ${result.errors} value(s) failed to store.` : "");
+
+      if (templateWarnings.length > 0) {
+        resultText += `\n\nWarnings from template:\n${templateWarnings.map((w) => `  • ${w}`).join("\n")}`;
+      }
 
       return {
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `Imported ${result.stored} credential(s) from "${filePath}" into secret store.` +
-              `\nNamespace: ${namespace}` +
-              `\n\n${lines}` +
-              note +
-              `\n\nUse get_secret/with_secret to access these values.` +
-              (result.errors > 0 ? `\n\n⚠ ${result.errors} value(s) failed to store.` : ""),
-          },
-        ],
+        content: [{ type: "text" as const, text: resultText }],
         details: {
           imported: result.stored,
           errors: result.errors,
@@ -1211,6 +1213,7 @@ export default function (pi: ExtensionAPI) {
           namespace,
           deleted: result.deleted,
           keys: result.keys,
+          templateWarnings: templateWarnings.length > 0 ? templateWarnings : undefined,
         },
       };
     },

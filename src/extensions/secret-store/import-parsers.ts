@@ -224,6 +224,15 @@ export function deriveNamespace(filePath: string): string {
 // =============================================================================
 
 /**
+ * Result from a custom template parse, including any warnings
+ * (e.g. invalid regex patterns that were skipped).
+ */
+export interface TemplateParseResult {
+  entries: Array<{ key: string; value: string }>;
+  warnings: string[];
+}
+
+/**
  * Parse credential file content using a custom regex template.
  *
  * The template's pattern is applied globally across the content.
@@ -231,12 +240,15 @@ export function deriveNamespace(filePath: string): string {
  * and value (from `valueGroup`, default "value") from named capture groups.
  *
  * Optionally skips lines matching `skipPattern` before matching.
+ *
+ * Returns both the matched entries and any warnings (invalid sub-patterns,
+ * skipped configurations, etc.).
  */
 export function parseWithTemplate(
   content: string,
   template: CredentialTemplate
-): Array<{ key: string; value: string }> {
-  const result: Array<{ key: string; value: string }> = [];
+): TemplateParseResult {
+  const result: TemplateParseResult = { entries: [], warnings: [] };
 
   // Apply skip filter if provided
   let text = content;
@@ -244,8 +256,8 @@ export function parseWithTemplate(
     try {
       const skipRe = new RegExp(template.skipPattern, "gm");
       text = text.replace(skipRe, "");
-    } catch {
-      // Invalid skip pattern — proceed without filtering
+    } catch (e: any) {
+      result.warnings.push(`Invalid skip pattern "${template.skipPattern}": ${e.message}`);
     }
   }
 
@@ -261,13 +273,13 @@ export function parseWithTemplate(
       const key = (groups[keyGroup] ?? "").trim();
       const value = stripQuotes((groups[valueGroup] ?? "").trim());
       if (!key) continue;
-      result.push({ key, value });
+      result.entries.push({ key, value });
 
       // Avoid infinite loop on zero-length matches
       if (match.index === re.lastIndex) re.lastIndex++;
     }
-  } catch {
-    // Invalid regex — return empty
+  } catch (e: any) {
+    result.warnings.push(`Invalid template pattern: ${e.message}`);
   }
 
   return result;

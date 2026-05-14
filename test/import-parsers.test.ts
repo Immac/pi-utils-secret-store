@@ -18,6 +18,7 @@ import {
   parseWithTemplate,
   deriveNamespace,
   type CredentialTemplate,
+  type TemplateParseResult,
 } from "../src/extensions/secret-store/import-parsers.js";
 
 // =============================================================================
@@ -289,11 +290,12 @@ async function testParseWithTemplate_basic() {
     flags: "gm",
   };
   const result = parseWithTemplate("USER=admin\nPASS=secret123", template);
-  assert.equal(result.length, 2);
-  assert.equal(result[0].key, "USER");
-  assert.equal(result[0].value, "admin");
-  assert.equal(result[1].key, "PASS");
-  assert.equal(result[1].value, "secret123");
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0].key, "USER");
+  assert.equal(result.entries[0].value, "admin");
+  assert.equal(result.entries[1].key, "PASS");
+  assert.equal(result.entries[1].value, "secret123");
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_basic");
 }
 
@@ -307,11 +309,12 @@ async function testParseWithTemplate_namedGroups() {
     valueGroup: "v",
   };
   const result = parseWithTemplate("name=db,secret=hunter2\nname=api,secret=xyz789", template);
-  assert.equal(result.length, 2);
-  assert.equal(result[0].key, "db");
-  assert.equal(result[0].value, "hunter2");
-  assert.equal(result[1].key, "api");
-  assert.equal(result[1].value, "xyz789");
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0].key, "db");
+  assert.equal(result.entries[0].value, "hunter2");
+  assert.equal(result.entries[1].key, "api");
+  assert.equal(result.entries[1].value, "xyz789");
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_namedGroups");
 }
 
@@ -327,9 +330,10 @@ async function testParseWithTemplate_skipPattern() {
     "# this is a comment\nAPI_KEY=sk-123\n# another comment\nDB_PASS=secret",
     template
   );
-  assert.equal(result.length, 2);
-  assert.equal(result[0].key, "API_KEY");
-  assert.equal(result[1].key, "DB_PASS");
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0].key, "API_KEY");
+  assert.equal(result.entries[1].key, "DB_PASS");
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_skipPattern");
 }
 
@@ -347,11 +351,12 @@ async function testParseWithTemplate_multiline() {
     "machine db.example.com\n  login admin\n  password s3cret\nmachine api.example.com\n  login user\n  password pass123",
     template
   );
-  assert.equal(result.length, 2);
-  assert.equal(result[0].key, "db.example.com");
-  assert.equal(result[0].value, "s3cret");
-  assert.equal(result[1].key, "api.example.com");
-  assert.equal(result[1].value, "pass123");
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries[0].key, "db.example.com");
+  assert.equal(result.entries[0].value, "s3cret");
+  assert.equal(result.entries[1].key, "api.example.com");
+  assert.equal(result.entries[1].value, "pass123");
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_multiline");
 }
 
@@ -362,9 +367,11 @@ async function testParseWithTemplate_invalidPattern() {
     pattern: "[invalid",
     flags: "gm",
   };
-  // Should not throw, return empty
+  // Should not throw, return empty with a warning
   const result = parseWithTemplate("foo=bar", template);
-  assert.equal(result.length, 0);
+  assert.equal(result.entries.length, 0);
+  assert.ok(result.warnings.length > 0, "Should report invalid regex warning");
+  assert.ok(result.warnings[0].includes("Invalid template pattern"));
   console.log("  ✓ testParseWithTemplate_invalidPattern");
 }
 
@@ -376,7 +383,8 @@ async function testParseWithTemplate_noMatch() {
     flags: "gm",
   };
   const result = parseWithTemplate("USER=admin\nPASS=secret", template);
-  assert.equal(result.length, 0);
+  assert.equal(result.entries.length, 0);
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_noMatch");
 }
 
@@ -387,8 +395,8 @@ async function testParseWithTemplate_emptyContent() {
     pattern: "^(?<key>\\w+)=(?<value>.+)$",
     flags: "gm",
   };
-  assert.equal(parseWithTemplate("", template).length, 0);
-  assert.equal(parseWithTemplate("  \n\n", template).length, 0);
+  assert.equal(parseWithTemplate("", template).entries.length, 0);
+  assert.equal(parseWithTemplate("  \n\n", template).entries.length, 0);
   console.log("  ✓ testParseWithTemplate_emptyContent");
 }
 
@@ -403,10 +411,11 @@ async function testParseWithTemplate_quotedValues() {
     'NAME=My App\nPASS=plain\nSECRET=hidden',
     template
   );
-  assert.equal(result.length, 3);
-  assert.equal(result[0].value, "My App");
-  assert.equal(result[1].value, "plain");
-  assert.equal(result[2].value, "hidden");
+  assert.equal(result.entries.length, 3);
+  assert.equal(result.entries[0].value, "My App");
+  assert.equal(result.entries[1].value, "plain");
+  assert.equal(result.entries[2].value, "hidden");
+  assert.equal(result.warnings.length, 0);
   console.log("  ✓ testParseWithTemplate_quotedValues");
 }
 
