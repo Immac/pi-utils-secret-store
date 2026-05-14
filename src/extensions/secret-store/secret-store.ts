@@ -23,11 +23,20 @@
 
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
+import { readFile, unlink } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { confirmDestructiveAction } from "./confirm.js";
+import {
+  detectFormat,
+  parseEnv,
+  parseJson,
+  parseIni,
+  deriveNamespace,
+} from "./import-parsers.js";
 
 const execAsync = promisify(execCb);
 
@@ -801,6 +810,150 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ===========================================================================
+  // Tool: import_secret
+  // ===========================================================================
+
+  pi.registerTool({
+    name: "import_secret",
+    label: "Import Secrets",
+    description:
+      "Import credentials from a local file into the secret store. " +
+      "Supports .env, JSON, and INI-like formats (e.g., ~/.aws/credentials). " +
+      "Values are stored under namespace:key derived from the file path. " +
+      "The source file can optionally be deleted after import.",
+    promptSnippet: "Import credentials from a file into the secret store",
+    promptGuidelines: [
+      "Use import_secret when you need to ingest credentials from a local file into the secret store.",
+      "After import, use get_secret/with_secret to access the values — never read credential files directly.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({
+        description:
+          "Path to the credential file. Supported formats: .env, .json, or INI-like (.aws/credentials, etc.).",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { path: filePath } = params;
+      const absolutePath = resolve(ctx.cwd, filePath);
+
+      // --- Read the file ---
+      let content: string;
+      try {
+        content = await readFile(absolutePath, "utf-8");
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot read file: ${e.message}` }],
+          details: { imported: false, error: e.message },
+        };
+      }
+
+      // --- Parse by format ---
+      const format = detectFormat(absolutePath);
+      let parsed: Array<{ key: string; value: string }>;
+      switch (format) {
+        case "env":
+          parsed = parseEnv(content);
+          break;
+        case "json":
+          parsed = parseJson(content);
+          break;
+        default:
+          parsed = parseIni(content);
+      }
+
+      if (parsed.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `No credentials found in "${filePath}" (${format} format).` }],
+          details: { imported: false, format, found: 0 },
+        };
+      }
+
+      // --- Derive namespace ---
+      const namespace = deriveNamespace(absolutePath);
+
+      // --- Confirm with user ---
+      if (ctx.hasUI) {
+        const summary = parsed.map((p) => `  • ${namespace}:${p.key}`).join("\n");
+        const ok = await ctx.ui.confirm(
+          "Import Credentials",
+          `Found ${parsed.length} credential(s) in "${filePath}" (${format} format):` +
+          `\n\n${summary}\n\nImport these into the secret store?`
+        );
+        if (!ok) {
+          return {
+            content: [{ type: "text" as const, text: "Import cancelled by user." }],
+            details: { imported: false, format, found: parsed.length, confirmed: false },
+          };
+        }
+      }
+
+      // --- Store each value in AuthStorage ---
+      let stored = 0;
+      let errors = 0;
+      for (const entry of parsed) {
+        try {
+          const authKey = `${namespace}:${entry.key}`;
+          auth.set(authKey, { type: "api_key", key: entry.value });
+          ephemeralSecrets.delete(authKey);
+          stored++;
+        } catch {
+          errors++;
+        }
+      }
+
+      // --- Offer to delete source file ---
+      let deleted = false;
+      if (ctx.hasUI && stored > 0) {
+        const shouldDelete = await ctx.ui.confirm(
+          "Delete Source File?",
+          `${stored} credential(s) imported under "${namespace}:" namespace. Delete the source file "${filePath}"?` +
+          "\n\nThe values are now safely stored in the secret store. The original file is a liability."
+        );
+        if (shouldDelete) {
+          try {
+            await unlink(absolutePath);
+            deleted = true;
+          } catch {
+            // Failed to delete — not critical
+          }
+        }
+      }
+
+      // --- Update status ---
+      const count = auth.list().length;
+      ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
+
+      const lines = parsed.map((p) => `  • ${namespace}:${p.key}`).join("\n");
+      const note = deleted
+        ? ` Source file "${filePath}" has been deleted.`
+        : "";
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Imported ${stored} credential(s) from "${filePath}" into secret store.` +
+              `\nNamespace: ${namespace}` +
+              `\n\n${lines}` +
+              note +
+              `\n\nUse get_secret/with_secret to access these values.` +
+              (errors > 0 ? `\n\n⚠ ${errors} value(s) failed to store.` : ""),
+          },
+        ],
+        details: {
+          imported: stored,
+          errors,
+          format,
+          namespace,
+          deleted,
+          keys: parsed.map((p) => `${namespace}:${p.key}`),
+        },
+      };
+    },
+  });
+
+  // ===========================================================================
   // Commands (for interactive debugging)
   // ===========================================================================
 
@@ -828,6 +981,78 @@ export default function (pi: ExtensionAPI) {
         ? `${process.env.HOME}/.pi/agent/auth.json`
         : "~/.pi/agent/auth.json";
       ctx.ui.notify(`📁 ${path}`, "info");
+    },
+  });
+
+  pi.registerCommand("secret-import", {
+    description: "Import credentials from a file into the secret store (usage: /secret-import <path>)",
+    handler: async (args, ctx) => {
+      const filePath = args.trim();
+      if (!filePath) {
+        ctx.ui.notify("Usage: /secret-import <path>", "warning");
+        return;
+      }
+
+      // Read and parse
+      const absolutePath = resolve(ctx.cwd, filePath);
+      let content: string;
+      try {
+        content = await readFile(absolutePath, "utf-8");
+      } catch (e: any) {
+        ctx.ui.notify(`Cannot read file: ${e.message}`, "error");
+        return;
+      }
+
+      const format = detectFormat(absolutePath);
+      let parsed: Array<{ key: string; value: string }>;
+      switch (format) {
+        case "env": parsed = parseEnv(content); break;
+        case "json": parsed = parseJson(content); break;
+        default: parsed = parseIni(content);
+      }
+
+      if (parsed.length === 0) {
+        ctx.ui.notify(`No credentials found in "${filePath}"`, "warning");
+        return;
+      }
+
+      const namespace = deriveNamespace(absolutePath);
+      const summary = parsed.map((p) => `  • ${namespace}:${p.key}`).join("\n");
+
+      const ok = await ctx.ui.confirm(
+        "Import Credentials",
+        `Found ${parsed.length} credential(s) in "${filePath}" (${format}):\n\n${summary}\n\nImport into secret store?`
+      );
+      if (!ok) {
+        ctx.ui.notify("Import cancelled.", "info");
+        return;
+      }
+
+      let stored = 0;
+      for (const entry of parsed) {
+        try {
+          auth.set(`${namespace}:${entry.key}`, { type: "api_key", key: entry.value });
+          ephemeralSecrets.delete(`${namespace}:${entry.key}`);
+          stored++;
+        } catch { /* skip */ }
+      }
+
+      // Offer delete
+      const shouldDelete = await ctx.ui.confirm(
+        "Delete Source?",
+        `${stored} credential(s) imported. Delete "${filePath}"?`
+      );
+      let deleted = false;
+      if (shouldDelete) {
+        try { await unlink(absolutePath); deleted = true; } catch {}
+      }
+
+      ctx.ui.setStatus("secret-store", `🔐 ${auth.list().length} secret(s)`);
+      ctx.ui.notify(
+        `Imported ${stored} credential(s) under "${namespace}:"` +
+        (deleted ? `. Source deleted.` : ""),
+        stored > 0 ? "info" : "warning"
+      );
     },
   });
 }

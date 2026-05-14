@@ -39,6 +39,26 @@ But `AuthStorage` is a **developer API** — the LLM can't call it directly. If 
 | `clear_secret` | Deletes one secret (requires typed confirmation) |
 | `forget_secrets` | Wipes ALL secrets (requires typed mantra) |
 | `get_secret_store_path` | Shows `~/.pi/agent/auth.json` |
+| `import_secret` | **NEW** — Import credentials from `.env`, JSON, or INI files into the secret store. Namespaces values by parent directory name. Optionally deletes the source file after import. |
+
+#### `import_secret` — bulk credential import
+
+Reads a credential file, detects its format (`.env`, `.json`, or INI-like), and stores each value in `AuthStorage` under a `namespace:key` derived from the file path.
+
+**Namespace convention:**
+
+| Source file | Namespace | Stored keys |
+|-------------|-----------|-------------|
+| `~/.aws/credentials` | `aws` | `aws:default:aws_access_key_id`, `aws:default:aws_secret_access_key` |
+| `my-project/.env` | `my-project` | `my-project:DATABASE_URL`, `my-project:API_KEY` |
+| `config/secrets.json` | `config` | `config:client_id`, `config:client_secret` |
+
+**Flow:**
+1. User or LLM calls `import_secret(path: "~/.aws/credentials")`
+2. Tool reads, parses, shows what was found, asks for confirmation
+3. Stores each value under `aws:default:aws_access_key_id` etc.
+4. Offers to delete the source file (it's a liability once imported)
+5. Values are then accessible via `get_secret` / `with_secret`
 
 ### Why this exists
 
@@ -73,6 +93,18 @@ LLM:  get_secret(key="db_password")
 
 LLM:  with_secret(key="db_password", command="mysql -u root -p$SECRET < schema.sql")
   →  Secret injected as env var, never in content. Output returned.
+```
+
+### Bulk Import Workflow
+
+```
+User: "Set up the project from my .env file"
+
+LLM:  import_secret(path="project/.env")
+  →  Shows: "Found 3 credentials. Import?"
+  →  User confirms → Stored as project:DATABASE_URL, etc.
+  →  "Delete source file? [Y/n]"
+  →  Source deleted, values available via get_secret/with_secret
 ```
 
 ---

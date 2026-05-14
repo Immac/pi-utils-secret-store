@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "validate": "tsc --noEmit --skipLibCheck",
-    "test": "npx tsx test/secret-store.test.ts && npx tsx test/secret-service-backend.test.ts"
+    "test": "npx tsx test/import-parsers.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
