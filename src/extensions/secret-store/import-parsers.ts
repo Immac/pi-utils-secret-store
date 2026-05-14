@@ -93,15 +93,7 @@ export function parseEnv(
     if (eqIdx === -1) continue;
 
     const key = trimmed.slice(0, eqIdx).trim();
-    let value = trimmed.slice(eqIdx + 1).trim();
-
-    // Strip surrounding quotes
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
+    let value = stripQuotes(trimmed.slice(eqIdx + 1).trim());
 
     if (key) result.push({ key, value });
   }
@@ -176,14 +168,7 @@ export function parseIni(
     if (sepIdx === -1) continue;
 
     const key = trimmed.slice(0, sepIdx).trim();
-    let value = trimmed.slice(sepIdx + 1).trim();
-
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
+    let value = stripQuotes(trimmed.slice(sepIdx + 1).trim());
 
     if (!key) continue;
 
@@ -208,6 +193,21 @@ export function parseIni(
  *   /projects/my-app/.env    → "my-app"
  *   /home/user/config.json   → "config"
  */
+/**
+ * Strip matching surrounding quotes from a string.
+ * Handles both single and double quotes. Returns the stripped value
+ * if quotes match, or the original value unchanged.
+ */
+export function stripQuotes(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 export function deriveNamespace(filePath: string): string {
   const expanded = filePath.replace(
     /^~/,
@@ -259,15 +259,8 @@ export function parseWithTemplate(
     while ((match = re.exec(text)) !== null) {
       const groups = match.groups ?? {};
       const key = (groups[keyGroup] ?? "").trim();
-      let value = (groups[valueGroup] ?? "").trim();
+      const value = stripQuotes((groups[valueGroup] ?? "").trim());
       if (!key) continue;
-      // Strip surrounding quotes
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
       result.push({ key, value });
 
       // Avoid infinite loop on zero-length matches
