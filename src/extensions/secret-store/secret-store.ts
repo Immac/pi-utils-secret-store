@@ -116,6 +116,15 @@ function secretSummary(key: string, value: string, persisted: boolean): string {
   return `Secret "${key}" ${lengthHint} stored (${storage}, value: ${preview})`;
 }
 
+/**
+ * Check whether a stored secret is a structured object (e.g., {type, key})
+ * rather than a plain string or runtime override.
+ */
+function rawHasStructure(key: string): boolean {
+  const raw = auth.get(key);
+  return raw !== undefined && typeof raw === "object" && raw !== null;
+}
+
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
@@ -275,15 +284,28 @@ export default function (pi: ExtensionAPI) {
       "Retrieve a previously stored secret by its key. The secret is cached " +
       "in memory so you can use it with with_secret — the raw value is never " +
       "exposed in tool result content. If the secret doesn't exist, you'll " +
-      "need to use ask_secret first.",
+      "need to use ask_secret first.\n\n" +
+      "Secrets may be stored as structured objects (e.g., " +
+      '{"type": "api_key", "key": "..."}) rather than plain strings. ' +
+      "Use showStructure=true to inspect the secret's metadata (type, auth scheme, " +
+      "persistence) without exposing the raw value.",
     promptSnippet: "Retrieve a previously stored secret by key",
     parameters: Type.Object({
       key: Type.String({
         description: "The identifier of the secret to retrieve (e.g., 'github_token', 'database_password').",
       }),
+      showStructure: Type.Optional(
+        Type.Boolean({
+          description:
+            "If true, show the secret's storage metadata (type, auth scheme, " +
+            "prefix hint, source) without executing any !command resolution. " +
+            "Useful for understanding how a secret is structured before using it " +
+            "with with_secret. Default: false.",
+        })
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const { key } = params;
+      const { key, showStructure } = params;
 
       // Check existence via auth.get (checks auth.json + runtime overrides)
       if (!auth.has(key)) {
@@ -298,7 +320,69 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Resolve the actual value — this runs !commands if applicable
+      // --- Structure-only mode (no resolution, no value exposure) ---
+      if (showStructure) {
+        const raw = auth.get(key);
+        const isEphemeral = ephemeralSecrets.has(key);
+        const source = isEphemeral ? "runtime override (session-only)" : "auth.json (persisted)";
+
+        let typeLabel = "unknown";
+        let schemeHint = "unknown";
+        let prefixHint = "none";
+        let valueLengthHint = "unknown";
+
+        if (isEphemeral) {
+          // Runtime overrides are plain strings, not stored as AuthCredential
+          typeLabel = "plain string (runtime override)";
+          schemeHint = "direct value — use as-is";
+          valueLengthHint = "(resolved at runtime)";
+        } else if (raw) {
+          const t = (raw as Record<string, unknown>).type;
+          typeLabel = typeof t === "string" ? t : "object (no type field)";
+          if ((raw as Record<string, unknown>).key) {
+            const keyVal = String((raw as Record<string, unknown>).key);
+            valueLengthHint = String(keyVal.length);
+            if (keyVal.length > 4) {
+              prefixHint = `key starts with "${sanitizeForDisplay(keyVal)}"`;
+            }
+          }
+          if (t === "api_key") {
+            schemeHint = "Bearer token or similar — use in Authorization header";
+          } else if (t === "oauth") {
+            const exp = (raw as Record<string, unknown>).expires;
+            const expStr = typeof exp === "number"
+              ? `expires ${new Date(exp).toISOString()}`
+              : "no expiration";
+            schemeHint = `OAuth token (${expStr})`;
+          }
+        }
+
+        const lines = [
+          `Secret "${key}" structure:`,
+          `  • Type: ${typeLabel}`,
+          `  • Auth scheme: ${schemeHint}`,
+          `  • Value length: ${valueLengthHint}`,
+          `  • Prefix hint: ${prefixHint}`,
+          `  • Source: ${source}`,
+        ];
+
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+          details: {
+            found: true,
+            key,
+            structure: {
+              type: typeLabel,
+              scheme: schemeHint,
+              valueLength: valueLengthHint,
+              prefix: prefixHint,
+              source,
+            },
+          },
+        };
+      }
+
+      // --- Resolve the actual value — this runs !commands if applicable ---
       const value = await auth.getApiKey(key);
       if (value === undefined) {
         return {
@@ -320,7 +404,8 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: `Secret "${key}" (${length} chars, ${tag}) retrieved. Use with_secret(key="${key}", command="...") to run a command with it injected as \\$SECRET.`,
+            text: `Secret "${key}" (${length} chars, ${tag}) retrieved. Use with_secret(key="${key}", command="...") to run a command with it injected as \\$SECRET.` +
+              (rawHasStructure(key) ? `\n\nNote: This secret is stored as a structured object. with_secret automatically resolves it — \$SECRET will contain just the key value, not the wrapper.` : ""),
           },
         ],
         details: { found: true, key, valueLength: length, persisted: !isEphemeral },
@@ -374,11 +459,19 @@ export default function (pi: ExtensionAPI) {
       "environment. It never appears in tool result content, session history, " +
       "TUI display, or bash history.\n\n" +
       "The secret is available as \\$SECRET inside the command by default. " +
-      "Use envVarName to pick a different variable name.",
+      "Use envVarName to pick a different variable name.\n\n" +
+      "**Structured secrets:** Secrets may be stored as objects like " +
+      '{"type": "api_key", "key": "..."} rather than plain strings. ' +
+      "The tool automatically resolves these — \\$SECRET always contains " +
+      "just the resolved string value, not the wrapper object.\n\n" +
+      "**Validate mode:** Set validate=true to check a secret's characteristics " +
+      "without executing any command (safe dry-run).",
     promptSnippet: "Run a command with a cached secret injected as $SECRET env var",
     promptGuidelines: [
       "Use with_secret after get_secret to use a secret in a command without leaking it into conversation history or bash history.",
       "The secret is available as $SECRET inside the command by default. Set envVarName to change the variable name.",
+      "Secrets may be stored as structured objects (e.g., {type, key}); with_secret resolves them automatically.",
+      "Use validate=true to inspect a secret's metadata without executing any command.",
     ],
     parameters: Type.Object({
       key: Type.String({
@@ -386,11 +479,14 @@ export default function (pi: ExtensionAPI) {
           "The key of the secret to use. Must have been stored via ask_secret first. " +
           "AuthStorage resolves !command syntax if the secret was stored as a shell command.",
       }),
-      command: Type.String({
-        description:
-          "The shell command to run. Reference the secret via \\$SECRET (or the name you " +
-          "specify in envVarName). Example: 'curl -H \"Authorization: Bearer $SECRET\" https://api.example.com'",
-      }),
+      command: Type.Optional(
+        Type.String({
+          description:
+            "The shell command to run. Reference the secret via \\$SECRET (or the name you " +
+            "specify in envVarName). Example: 'curl -H \"Authorization: Bearer $SECRET\" https://api.example.com'. " +
+            "Omit if validate=true.",
+        })
+      ),
       envVarName: Type.Optional(
         Type.String({
           description:
@@ -403,9 +499,17 @@ export default function (pi: ExtensionAPI) {
           description: "Timeout in milliseconds for the command (default: 60000).",
         })
       ),
+      validate: Type.Optional(
+        Type.Boolean({
+          description:
+            "If true, resolve the secret and report its metadata (type, length, prefix, source) " +
+            "without executing any command. Use this as a safe dry-run to verify a secret " +
+            "is accessible before using it in a real command. Default: false.",
+        })
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const { key, command, envVarName, timeout } = params;
+      const { key, command, envVarName, timeout, validate } = params;
 
       // --- Look up the secret via AuthStorage ---
       // auth.has() checks auth.json + runtime overrides
@@ -435,17 +539,75 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // --- Inject as env var and run ---
       const varName = envVarName || "SECRET";
+      const isEphemeral = ephemeralSecrets.has(key);
+      const source = isEphemeral ? "runtime override (session-only)" : "auth.json (persisted)";
+      const hasStructure = rawHasStructure(key);
+      const preview = sanitizeForDisplay(secret);
+
+      // --- Validate mode: dry-run, no command execution ---
+      if (validate) {
+        let typeDesc = "plain string";
+        if (hasStructure) {
+          const raw = auth.get(key);
+          const t = raw && typeof raw === "object"
+            ? (raw as Record<string, unknown>).type
+            : undefined;
+          typeDesc = typeof t === "string" ? `structured (${t})` : "structured (unknown type)";
+        }
+
+        const lines = [
+          `✓ Secret "${key}" is accessible via \$${varName}`,
+          `  • Type: ${typeDesc}`,
+          `  • Length: ${secret.length} chars`,
+          `  • Prefix: ${preview}`,
+          `  • Source: ${source}`,
+          `  • Resolution: ${hasStructure ? "auto-resolved from structured object" : "direct"}`,
+          ``,
+          `Ready for with_secret(key="${key}", command="..."). ` +
+          `Use \$${varName} inside the command to reference the secret.`,
+        ];
+
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+          details: {
+            executed: true,
+            key,
+            envVar: varName,
+            exitCode: 0,
+            mode: "validate",
+            secretLength: secret.length,
+            source,
+            hasStructure,
+          },
+        };
+      }
+
+      // --- command is required when not in validate mode ---
+      if (!command || command.trim() === "") {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `No command provided. Either pass a command to execute, or set validate=true for a dry-run check.`,
+            },
+          ],
+          details: { executed: false, key, reason: "no_command" },
+        };
+      }
+
+      // --- Inject as env var and run ---
       const cwd = ctx.cwd;
       const maxBytes = 50 * 1024;
       const maxLines = 2000;
+
+      const effectiveTimeout = timeout ?? 60_000;
 
       try {
         const { stdout, stderr } = await execAsync(command, {
           cwd,
           env: { ...process.env, [varName]: secret },
-          timeout: timeout ?? 60_000,
+          timeout: effectiveTimeout,
           maxBuffer: maxBytes,
           signal,
         });
@@ -475,15 +637,47 @@ export default function (pi: ExtensionAPI) {
           },
         };
       } catch (e: any) {
-        const exitCode = e.code ?? (e.killed ? -1 : 1);
+        // --- Distinguish abort vs timeout vs normal failure ---
+        const isAborted = signal?.aborted === true;
+        const isKilled = e.killed === true;
+        const signalName = e.signal ?? null;
+        const isExecTimeout = e.code === undefined && isKilled && signalName === "SIGTERM";
+
+        let reason: string;
+        if (isAborted) {
+          reason = "tool execution was aborted (session may have been interrupted)";
+        } else if (isExecTimeout) {
+          reason = `timed out after ${effectiveTimeout}ms`;
+        } else if (isKilled && signalName) {
+          reason = `killed by signal ${signalName}`;
+        } else if (isKilled) {
+          reason = "killed (unknown signal)";
+        } else if (e.code !== undefined && e.code !== null) {
+          reason = `exited with code ${e.code}`;
+        } else {
+          reason = `error: ${e.message ?? "unknown"}`;
+        }
+
+        const exitCode = e.code ?? (isKilled ? -1 : 1);
         const stderr = e.stderr ?? "";
         const stdout = e.stdout ?? "";
+
+        // Build a diagnostic message
+        const diagParts: string[] = [];
+        if (stdout) diagParts.push(stdout);
+        if (stderr) diagParts.push(`stderr: ${stderr.slice(0, 1000)}`);
+        if (diagParts.length === 0) {
+          diagParts.push(`Command failed: ${reason}`);
+        } else {
+          // Append reason as a suffix when there's output
+          diagParts.push(`\n[exit ${exitCode}, ${reason}]`);
+        }
 
         return {
           content: [
             {
               type: "text" as const,
-              text: stdout || stderr || `Command failed (exit ${exitCode})`,
+              text: diagParts.join("\n"),
             },
           ],
           details: {
@@ -491,6 +685,9 @@ export default function (pi: ExtensionAPI) {
             key,
             envVar: varName,
             exitCode,
+            killed: isKilled,
+            signal: signalName,
+            reason,
             stderr,
           },
         };
@@ -498,11 +695,12 @@ export default function (pi: ExtensionAPI) {
     },
     renderCall(args, theme, _context) {
       const varName = args.envVarName || "SECRET";
+      const cmdPreview = args.command?.slice(0, 80) ?? "<validate>";
       return new Text(
         theme.fg("toolTitle", theme.bold("with_secret ")) +
         theme.fg("accent", args.key) +
-        theme.fg("muted", ` → \\$${varName} `) +
-        theme.fg("dim", args.command.slice(0, 80)),
+        theme.fg("muted", ` → \$${varName} `) +
+        theme.fg("dim", cmdPreview),
         0, 0
       );
     },
