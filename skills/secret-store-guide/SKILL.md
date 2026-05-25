@@ -19,8 +19,13 @@ The Secret Store extension replaces insecure `read`/`bash` credential gathering 
 `ask_secret` → user types in a `•`-masked dialog → secret is stored → agent
 retrieves it later with `get_secret`.
 
+**Credential Guard** is a companion extension that blocks reading of credential
+files at the tool level. When both are installed, `import_secret` lets you safely
+ingest `.env` or `.aws/credentials` into the store instead of reading them raw.
+
 **Load this skill when** you need to ask for, retrieve, list, or clear credentials,
-or when the user mentions "secrets", "credentials", "stored passwords", or "tokens".
+or when the user mentions "secrets", "credentials", "stored passwords", "tokens",
+or "credential guard".
 
 ---
 
@@ -39,7 +44,7 @@ pi install /path/to/secret-store    # or symlink: ln -s ... ~/.pi/agent/packages
 
 ## 2. Tool Reference
 
-All 7 tools. **Key security rule:** keys matching `sudo`, `password`, `passwd`,
+All 12 tools. **Key security rule:** keys matching `sudo`, `password`, `passwd`,
 `pass`, `root`, `admin`, `token`, `ssh_key`, `api_secret`, and patterns like
 `root_password` / `db_password` / `access_token` are **NEVER persisted**
 (case-insensitive substring match). The blocklist is absolute — `persist: true`
@@ -57,6 +62,12 @@ summary (`fi****en`) to agent; full value available via `get_secret`.
 
 Returns stored value in `content` — agent can use directly. Returns "not found"
 if key doesn't exist.
+
+### `with_secret(key, command, envVarName?, timeout?)`
+
+Runs a shell command with the secret injected as an environment variable.
+The value is never exposed in tool content, session history, or bash history.
+Reference via `$SECRET` (or `$envVarName` if set).
 
 ### `list_secrets()`
 
@@ -79,12 +90,39 @@ Return active backend name. Possible values: `secret-service` (Linux),
 `macos-keychain` (macOS), `windows-credential-manager` (Win),
 `encrypted-file` (fallback, AES-256-GCM).
 
+### `import_secret(path, template?)`
+
+Bulk import credentials from a file into the secret store. Detects format from
+file path (`.env`, `.json`, or INI-like). Values stored under `namespace:key`
+where namespace is the parent directory name (e.g., `~/.aws/credentials` →
+`aws:default:aws_access_key_id`).
+
+Optional `template` parameter accepts:
+- **String**: name of a registered template (see `import_secret_template_add`)
+- **Object**: inline pattern `{ pattern, flags, keyGroup?, valueGroup?, skipPattern? }`
+
+**Flow:** reads file → parses → confirms with user → stores → optionally deletes source.
+
+### `import_secret_template_add(name, description, pattern, flags?, keyGroup?, valueGroup?, filePattern?, skipPattern?)`
+
+Register a custom regex template for parsing non-standard credential file formats.
+Pattern must include `(?<key>...)` and `(?<value>...)` named capture groups.
+
+### `import_secret_template_list()`
+
+List all registered custom templates with descriptions and auto-detect patterns.
+
+### `import_secret_template_remove(name)`
+
+Remove a previously registered template by name.
+
 ### Commands
 
 | Command | Action |
 |---------|--------|
 | `/secrets` | List stored keys (interactive) |
 | `/secret-path` | Show active backend name |
+| `/secret-import <path>` | Import credentials from a file interactively |
 
 ---
 
@@ -114,6 +152,38 @@ Agent: clear_secret("github_token") → user types name to confirm
   → ask_secret("github_token", "Enter your new token")
 ```
 
+### Bulk import from a file
+
+```
+User: "Set up the project from .env"
+Agent: import_secret(path="project/.env")
+  → parses as .env format → lists found keys → user confirms
+  → stored as project:DATABASE_URL, project:API_KEY etc.
+  → "Delete source file?" → optionally removes the plaintext
+  → Values available via get_secret / with_secret
+```
+
+### Import with a custom template
+
+```
+User: "Import credentials from my server config"
+Agent: import_secret_template_add(
+         name="server-config",
+         pattern="^(?<key>\\w+)\\s*=\\s*(?<value>.+)$",
+         flags="gm")
+  → import_secret(path="server.cfg", template="server-config")
+  → parses using the custom regex → user confirms → stored
+```
+
+### Using with_secret (safe command execution)
+
+```
+User: "Deploy using my db password"
+Agent: with_secret(key="db_password",
+         command="mysql -u root -p$SECRET < schema.sql")
+  → secret injected as env var, never in session history
+```
+
 ### Session-only (blocked) credentials
 
 ```
@@ -138,7 +208,9 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 - Always use `ask_secret` — never `read`/`bash` for credentials
 - Check `list_secrets()` first before re-prompting the same key
 - Use meaningful key names (`github_token` not `key1`)
-- Don't log or echo secret values — `get_secret` returns them in `content`
+- Use `with_secret` to run commands with secrets — `$SECRET` env var never leaks
+- For bulk imports, use `import_secret(path)` — it handles `read`-blocked files
+- Register custom regex templates for non-standard file formats
 - Clear ephemeral secrets after use
 
 **For users:**
@@ -172,16 +244,21 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 │                                                           │
 │  ask_secret(key, prompt, persist?)                        │
 │    → masked dialog → store → sanitized summary to agent   │
-│  get_secret(key)         → full value in content          │
+│  get_secret(key)         → metadata only; use with_secret │
+│  with_secret(key, cmd)   → $SECRET env var, never in text │
 │  list_secrets()          → keys with 💾/🧠 icons           │
 │  clear_secret(key)       → user types key to confirm      │
 │  forget_secrets()        → user types random phrase       │
+│  import_secret(path)     → bulk import .env/json/INI      │
+│  import_secret_template_add / list / remove               │
+│    → custom regex templates for non-standard formats      │
 │  get_secret_store_path() → backend name                   │
 │  get_active_backend()    → backend name only              │
 │                                                           │
 │  🧠 = ephemeral (session)    💾 = persisted (survives)    │
 │  🔒 Blocked keys NEVER persisted (sudo, password, token…) │
 │                                                           │
-│  Commands: /secrets  /secret-path                         │
+│  Commands: /secrets  /secret-path  /secret-import <path>  │
+└───────────────────────────────────────────────────────────┘
 └───────────────────────────────────────────────────────────┘
 ```
