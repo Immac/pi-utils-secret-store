@@ -17,6 +17,7 @@ import {
   parseIni,
   parseWithTemplate,
   deriveNamespace,
+  redactSecretFromOutput,
   type CredentialTemplate,
   type TemplateParseResult,
 } from "../src/extensions/secret-store/import-parsers.js";
@@ -420,6 +421,68 @@ async function testParseWithTemplate_quotedValues() {
 }
 
 // =============================================================================
+// redactSecretFromOutput
+// =============================================================================
+
+async function testRedactSecret_basic() {
+  const result = redactSecretFromOutput("token=abc123", "abc123");
+  assert.equal(result, "token=[REDACTED]");
+  console.log("  ✓ testRedactSecret_basic");
+}
+
+async function testRedactSecret_noMatch() {
+  const result = redactSecretFromOutput("all good here", "s3cret");
+  assert.equal(result, "all good here");
+  console.log("  ✓ testRedactSecret_noMatch");
+}
+
+async function testRedactSecret_multipleOccurrences() {
+  const result = redactSecretFromOutput(
+    "key=abc123, token=abc123, hash=abc123",
+    "abc123"
+  );
+  assert.equal(result, "key=[REDACTED], token=[REDACTED], hash=[REDACTED]");
+  console.log("  ✓ testRedactSecret_multipleOccurrences");
+}
+
+async function testRedactSecret_tooShort() {
+  // Secrets < 3 chars are not redacted (threshold guard)
+  const result = redactSecretFromOutput("token=ab", "ab");
+  assert.equal(result, "token=ab");
+  console.log("  ✓ testRedactSecret_tooShort");
+}
+
+async function testRedactSecret_regexMetacharacters() {
+  // Secret contains . * + etc. — should be escaped, not interpreted as regex
+  const result = redactSecretFromOutput(
+    "token=foo.bar+123",
+    "foo.bar+123"
+  );
+  assert.equal(result, "token=[REDACTED]");
+  console.log("  ✓ testRedactSecret_regexMetacharacters");
+}
+
+async function testRedactSecret_partialMatch() {
+  // Exact secret within a larger word — the matching substring gets redacted
+  const result = redactSecretFromOutput(
+    "my_secret is abc123extra and abc123 is the secret",
+    "abc123"
+  );
+  assert.equal(result, "my_secret is [REDACTED]extra and [REDACTED] is the secret");
+  console.log("  ✓ testRedactSecret_partialMatch");
+}
+
+async function testRedactSecret_emptyOutput() {
+  assert.equal(redactSecretFromOutput("", "secret"), "");
+  console.log("  ✓ testRedactSecret_emptyOutput");
+}
+
+async function testRedactSecret_emptySecret() {
+  assert.equal(redactSecretFromOutput("some output", ""), "some output");
+  console.log("  ✓ testRedactSecret_emptySecret");
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -468,6 +531,16 @@ async function main() {
   await testParseWithTemplate_noMatch();
   await testParseWithTemplate_emptyContent();
   await testParseWithTemplate_quotedValues();
+
+  // redactSecretFromOutput
+  await testRedactSecret_basic();
+  await testRedactSecret_noMatch();
+  await testRedactSecret_multipleOccurrences();
+  await testRedactSecret_tooShort();
+  await testRedactSecret_regexMetacharacters();
+  await testRedactSecret_partialMatch();
+  await testRedactSecret_emptyOutput();
+  await testRedactSecret_emptySecret();
 
   console.log("\nAll import-parsers tests passed ✓");
 }

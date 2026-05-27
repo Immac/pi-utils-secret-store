@@ -39,6 +39,7 @@ import {
   parseIni,
   parseWithTemplate,
   deriveNamespace,
+  redactSecretFromOutput,
   type CredentialTemplate,
 } from "./import-parsers.js";
 
@@ -176,22 +177,6 @@ function errorMessage(err: unknown, fallback?: string): string {
 function sanitizeForDisplay(value: string): string {
   if (value.length <= 4) return "****";
   return value.slice(0, 2) + "****" + value.slice(-2);
-}
-
-/**
- * Redact the exact secret value from command output to prevent accidental
- * leaks (e.g. verbose curl logging the auth header, echo \$SECRET, debug prints).
- *
- * Only redacts the exact string — this catches "I accidentally echoed it"
- * without touching legitimate API responses or command output.
- */
-function redactSecretFromOutput(output: string, secret: string): string {
-  if (!secret || secret.length < 3) return output;
-  // Replace exact occurrences. Use a regex with global flag and escaped
-  // special characters so we don't accidentally interpret regex metacharacters
-  // in the secret value itself.
-  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return output.replace(new RegExp(escaped, "g"), "[REDACTED]");
 }
 
 function secretSummary(key: string, value: string, persisted: boolean): string {
