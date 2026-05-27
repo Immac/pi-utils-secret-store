@@ -39,6 +39,7 @@ import {
   parseIni,
   parseWithTemplate,
   deriveNamespace,
+  redactSecretFromOutput,
   type CredentialTemplate,
 } from "./import-parsers.js";
 
@@ -158,25 +159,24 @@ function isDoNotPersist(key: string): boolean {
 // Helpers
 // =============================================================================
 
+/**
+ * Safely extract an error message from an unknown caught value.
+ * Use this instead of `catch (e: any)` to avoid disabling type checking
+ * on error branches.
+ */
+function errorMessage(err: unknown, fallback?: string): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const msg = (err as Record<string, unknown>).message;
+    if (typeof msg === "string") return msg;
+  }
+  return fallback ?? String(err);
+}
+
 function sanitizeForDisplay(value: string): string {
   if (value.length <= 4) return "****";
   return value.slice(0, 2) + "****" + value.slice(-2);
-}
-
-/**
- * Redact the exact secret value from command output to prevent accidental
- * leaks (e.g. verbose curl logging the auth header, echo \$SECRET, debug prints).
- *
- * Only redacts the exact string — this catches "I accidentally echoed it"
- * without touching legitimate API responses or command output.
- */
-function redactSecretFromOutput(output: string, secret: string): string {
-  if (!secret || secret.length < 3) return output;
-  // Replace exact occurrences. Use a regex with global flag and escaped
-  // special characters so we don't accidentally interpret regex metacharacters
-  // in the secret value itself.
-  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return output.replace(new RegExp(escaped, "g"), "[REDACTED]");
 }
 
 function secretSummary(key: string, value: string, persisted: boolean): string {
@@ -745,12 +745,14 @@ export default function (pi: ExtensionAPI) {
             truncated,
           },
         };
-      } catch (e: any) {
-        // --- Distinguish abort vs timeout vs normal failure ---
+      } catch (e: unknown) {
+        // execAsync errors carry custom properties (killed, signal, code, stderr, stdout)
+        const execErr = e && typeof e === "object" ? (e as Record<string, unknown>) : {};
         const isAborted = signal?.aborted === true;
-        const isKilled = e.killed === true;
-        const signalName = e.signal ?? null;
-        const isExecTimeout = e.code === undefined && isKilled && signalName === "SIGTERM";
+        const isKilled = execErr.killed === true;
+        const signalName = typeof execErr.signal === "string" ? execErr.signal : null;
+        const exitCodeRaw = typeof execErr.code === "number" ? execErr.code : undefined;
+        const isExecTimeout = exitCodeRaw === undefined && isKilled && signalName === "SIGTERM";
 
         let reason: string;
         if (isAborted) {
@@ -761,15 +763,15 @@ export default function (pi: ExtensionAPI) {
           reason = `killed by signal ${signalName}`;
         } else if (isKilled) {
           reason = "killed (unknown signal)";
-        } else if (e.code !== undefined && e.code !== null) {
-          reason = `exited with code ${e.code}`;
+        } else if (exitCodeRaw !== undefined) {
+          reason = `exited with code ${exitCodeRaw}`;
         } else {
-          reason = `error: ${e.message ?? "unknown"}`;
+          reason = `error: ${errorMessage(e)}`;
         }
 
-        const exitCode = e.code ?? (isKilled ? -1 : 1);
-        const stderr = e.stderr ?? "";
-        const stdout = e.stdout ?? "";
+        const exitCode = exitCodeRaw ?? (isKilled ? -1 : 1);
+        const stderr = typeof execErr.stderr === "string" ? execErr.stderr : "";
+        const stdout = typeof execErr.stdout === "string" ? execErr.stdout : "";
 
         // Redact the secret from error output to prevent accidental leaks
         const safeStdout = redactSecretFromOutput(stdout, secret);
@@ -778,7 +780,11 @@ export default function (pi: ExtensionAPI) {
         // Build a diagnostic message
         const diagParts: string[] = [];
         if (safeStdout) diagParts.push(safeStdout);
-        if (safeStderr) diagParts.push(`stderr: ${safeStderr.slice(0, 1000)}`);
+        if (safeStderr) {
+          const stderrTruncated = safeStderr.length > maxBytes;
+          diagParts.push(`stderr: ${safeStderr.slice(0, maxBytes)}` +
+            (stderrTruncated ? `\n\n[stderr truncated to ${maxBytes} bytes]` : ""));
+        }
         if (diagParts.length === 0) {
           diagParts.push(`Command failed: ${reason}`);
         } else {
@@ -1245,15 +1251,16 @@ export default function (pi: ExtensionAPI) {
       // Validate the pattern compiles
       try {
         new RegExp(params.pattern, params.flags ?? "gm");
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const msg = errorMessage(e);
         return {
           content: [
             {
               type: "text" as const,
-              text: `Invalid regex pattern: ${e.message}`,
+              text: `Invalid regex pattern: ${msg}`,
             },
           ],
-          details: { added: false, name: params.name, reason: "invalid_pattern", error: e.message },
+          details: { added: false, name: params.name, reason: "invalid_pattern", error: msg },
         };
       }
 
@@ -1443,10 +1450,11 @@ export default function (pi: ExtensionAPI) {
       let content: string;
       try {
         content = await readFile(absolutePath, "utf-8");
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const msg = errorMessage(e);
         return {
-          content: [{ type: "text" as const, text: `Cannot read file: ${e.message}` }],
-          details: { imported: false, error: e.message },
+          content: [{ type: "text" as const, text: `Cannot read file: ${msg}` }],
+          details: { imported: false, error: msg },
         };
       }
 
@@ -1667,8 +1675,8 @@ export default function (pi: ExtensionAPI) {
       let content: string;
       try {
         content = await readFile(absolutePath, "utf-8");
-      } catch (e: any) {
-        ctx.ui.notify(`Cannot read file: ${e.message}`, "error");
+      } catch (e: unknown) {
+        ctx.ui.notify(`Cannot read file: ${errorMessage(e)}`, "error");
         return;
       }
 
@@ -1697,8 +1705,8 @@ export default function (pi: ExtensionAPI) {
             "info"
           );
         }
-      } catch (e: any) {
-        ctx.ui.notify(`Error: ${e.message}`, "error");
+      } catch (e: unknown) {
+        ctx.ui.notify(`Error: ${errorMessage(e)}`, "error");
       }
     },
   });

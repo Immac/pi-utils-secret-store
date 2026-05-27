@@ -100,6 +100,22 @@ export function parseEnv(
   return result;
 }
 
+/**
+ * Redact the exact secret value from command output to prevent accidental
+ * leaks (e.g. verbose curl logging the auth header, echo \$SECRET, debug prints).
+ *
+ * Only redacts the exact string — this catches "I accidentally echoed it"
+ * without touching legitimate API responses or command output.
+ */
+export function redactSecretFromOutput(output: string, secret: string): string {
+  if (!secret || secret.length < 3) return output;
+  // Replace exact occurrences. Use a regex with global flag and escaped
+  // special characters so we don't accidentally interpret regex metacharacters
+  // in the secret value itself.
+  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return output.replace(new RegExp(escaped, "g"), "[REDACTED]");
+}
+
 // =============================================================================
 // JSON parser
 // =============================================================================
@@ -256,8 +272,9 @@ export function parseWithTemplate(
     try {
       const skipRe = new RegExp(template.skipPattern, "gm");
       text = text.replace(skipRe, "");
-    } catch (e: any) {
-      result.warnings.push(`Invalid skip pattern "${template.skipPattern}": ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      result.warnings.push(`Invalid skip pattern "${template.skipPattern}": ${msg}`);
     }
   }
 
@@ -278,8 +295,9 @@ export function parseWithTemplate(
       // Avoid infinite loop on zero-length matches
       if (match.index === re.lastIndex) re.lastIndex++;
     }
-  } catch (e: any) {
-    result.warnings.push(`Invalid template pattern: ${e.message}`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    result.warnings.push(`Invalid template pattern: ${msg}`);
   }
 
   return result;
