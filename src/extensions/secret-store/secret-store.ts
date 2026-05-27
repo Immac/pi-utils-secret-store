@@ -52,14 +52,60 @@ const execAsync = promisify(execCb);
  * AuthStorage-backed credential store.
  * Reads/writes ~/.pi/agent/auth.json with 0600 permissions.
  * Also checks environment variables and supports !command shell resolution.
+ *
+ * IMPORTANT: AuthStorage separates persisted data (this.data in auth.json)
+ * from runtime overrides (this.runtimeOverrides set via setRuntimeApiKey).
+ * The has(), get(), and list() methods only consult auth.json data, NOT
+ * runtime overrides. Since the secret-store extension uses setRuntimeApiKey()
+ * for ephemeral/blocklisted secrets, we must always check ephemeralSecrets
+ * alongside auth.has()/auth.list()/auth.get() to avoid hiding in-memory secrets.
  */
 let auth = AuthStorage.create();
 
 /**
  * Track which keys are ephemeral (set via setRuntimeApiKey vs auth.set).
- * Used so list_secrets can report persistence status accurately.
+ * Used so list_secrets can report persistence status accurately and so
+ * has()/get()/list() checks don't miss runtime-only secrets.
  */
 const ephemeralSecrets = new Set<string>();
+
+/**
+ * Return all known secret keys (persisted + ephemeral runtime overrides).
+ * AuthStorage.list() only returns keys from auth.json (this.data), missing
+ * any secrets stored via setRuntimeApiKey. This helper merges both sources.
+ */
+function allSecretKeys(): string[] {
+  const persisted = auth.list();
+  const all = new Set(persisted);
+  for (const k of ephemeralSecrets) all.add(k);
+  return [...all];
+}
+
+/**
+ * Check if a secret exists (in auth.json OR as a runtime override).
+ * AuthStorage.has() only checks auth.json data, so falls back to
+ * ephemeralSecrets for runtime-only secrets.
+ */
+function secretExists(key: string): boolean {
+  return auth.has(key) || ephemeralSecrets.has(key);
+}
+
+/**
+ * Get the raw stored credential for a key, checking runtime overrides
+ * as a fallback when auth.get() returns nothing.
+ * Returns the AuthCredential object (or undefined for runtime overrides
+ * which are stored as plain strings).
+ */
+function secretGet(key: string): unknown {
+  const fromAuth = auth.get(key);
+  if (fromAuth !== undefined) return fromAuth;
+  if (ephemeralSecrets.has(key)) {
+    // Runtime overrides are stored as plain strings, not AuthCredential objects.
+    // Return a marker so callers know the key exists but is ephemeral.
+    return { type: "runtime_override" };
+  }
+  return undefined;
+}
 
 // =============================================================================
 // Blocklist — keys matching these patterns are NEVER persisted
@@ -109,6 +155,22 @@ function sanitizeForDisplay(value: string): string {
   return value.slice(0, 2) + "****" + value.slice(-2);
 }
 
+/**
+ * Redact the exact secret value from command output to prevent accidental
+ * leaks (e.g. verbose curl logging the auth header, echo \$SECRET, debug prints).
+ *
+ * Only redacts the exact string — this catches "I accidentally echoed it"
+ * without touching legitimate API responses or command output.
+ */
+function redactSecretFromOutput(output: string, secret: string): string {
+  if (!secret || secret.length < 3) return output;
+  // Replace exact occurrences. Use a regex with global flag and escaped
+  // special characters so we don't accidentally interpret regex metacharacters
+  // in the secret value itself.
+  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return output.replace(new RegExp(escaped, "g"), "[REDACTED]");
+}
+
 function secretSummary(key: string, value: string, persisted: boolean): string {
   const preview = sanitizeForDisplay(value);
   const lengthHint = `(${value.length} chars)`;
@@ -119,10 +181,18 @@ function secretSummary(key: string, value: string, persisted: boolean): string {
 /**
  * Check whether a stored secret is a structured object (e.g., {type, key})
  * rather than a plain string or runtime override.
+ * Uses secretGet() which also checks ephemeralSecrets.
  */
 function rawHasStructure(key: string): boolean {
-  const raw = auth.get(key);
-  return raw !== undefined && typeof raw === "object" && raw !== null;
+  const raw = secretGet(key);
+  if (raw === undefined) return false;
+  if (typeof raw === "object" && raw !== null) {
+    // Runtime overrides return { type: "runtime_override" } marker;
+    // treat as non-structured (plain string underneath).
+    const obj = raw as Record<string, unknown>;
+    return obj.type !== "runtime_override";
+  }
+  return false;
 }
 
 // =============================================================================
@@ -136,7 +206,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     auth.reload();
-    const count = auth.list().length;
+    // auth.list() only returns persisted keys; count ALL secrets including runtime overrides
+    const count = allSecretKeys().length;
     if (count > 0) {
       ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
     }
@@ -154,6 +225,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "ask_secret",
     label: "Ask Secret",
+    executionMode: "sequential",
     description:
       "Prompt the user to enter a secret value (password, API key, token, etc.) " +
       "and store it securely. Uses PI's AuthStorage (~/.pi/agent/auth.json) with " +
@@ -202,7 +274,7 @@ export default function (pi: ExtensionAPI) {
         ? "\n\n⚠ This secret matches do-not-persist rules and will NEVER be written to disk."
         : "";
 
-      const existing = auth.get(key);
+      const existing = secretExists(key);
       const overwriteHint = existing
         ? `\n(This will overwrite an existing secret for "${key}".)`
         : "";
@@ -247,8 +319,8 @@ export default function (pi: ExtensionAPI) {
         actuallyPersisted = true;
       }
 
-      // --- Update status ---
-      const count = auth.list().length;
+      // --- Update status — use allSecretKeys() to count runtime overrides too ---
+      const count = allSecretKeys().length;
       ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
 
       // --- Summarize (never leak the full value) ---
@@ -307,8 +379,10 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { key, showStructure } = params;
 
-      // Check existence via auth.get (checks auth.json + runtime overrides)
-      if (!auth.has(key)) {
+      // Check existence via auth.has() AND ephemeralSecrets.
+      // AuthStorage.has() doesn't check runtime overrides (setRuntimeApiKey),
+      // so we must also check our own ephemeralSecrets tracking set.
+      if (!secretExists(key)) {
         return {
           content: [
             {
@@ -322,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 
       // --- Structure-only mode (no resolution, no value exposure) ---
       if (showStructure) {
-        const raw = auth.get(key);
+        const raw = secretGet(key);
         const isEphemeral = ephemeralSecrets.has(key);
         const source = isEphemeral ? "runtime override (session-only)" : "auth.json (persisted)";
 
@@ -336,11 +410,12 @@ export default function (pi: ExtensionAPI) {
           typeLabel = "plain string (runtime override)";
           schemeHint = "direct value — use as-is";
           valueLengthHint = "(resolved at runtime)";
-        } else if (raw) {
-          const t = (raw as Record<string, unknown>).type;
+        } else if (raw && typeof raw === "object" && raw !== null) {
+          const obj = raw as Record<string, unknown>;
+          const t = obj.type;
           typeLabel = typeof t === "string" ? t : "object (no type field)";
-          if ((raw as Record<string, unknown>).key) {
-            const keyVal = String((raw as Record<string, unknown>).key);
+          if (obj.key) {
+            const keyVal = String(obj.key);
             valueLengthHint = String(keyVal.length);
             if (keyVal.length > 4) {
               prefixHint = `key starts with "${sanitizeForDisplay(keyVal)}"`;
@@ -349,7 +424,7 @@ export default function (pi: ExtensionAPI) {
           if (t === "api_key") {
             schemeHint = "Bearer token or similar — use in Authorization header";
           } else if (t === "oauth") {
-            const exp = (raw as Record<string, unknown>).expires;
+            const exp = obj.expires;
             const expStr = typeof exp === "number"
               ? `expires ${new Date(exp).toISOString()}`
               : "no expiration";
@@ -512,8 +587,9 @@ export default function (pi: ExtensionAPI) {
       const { key, command, envVarName, timeout, validate } = params;
 
       // --- Look up the secret via AuthStorage ---
-      // auth.has() checks auth.json + runtime overrides
-      if (!auth.has(key)) {
+      // auth.has() only checks auth.json data, not runtime overrides.
+      // Check ephemeralSecrets as well to find session-only secrets.
+      if (!secretExists(key)) {
         return {
           content: [
             {
@@ -620,11 +696,14 @@ export default function (pi: ExtensionAPI) {
             `\n\n[Output truncated: ${Math.min(lines.length, maxLines)} of ${lines.length} lines]`
           : stdout;
 
+        // Redact the secret from output to prevent accidental leaks
+        const safeOutput = redactSecretFromOutput(output, secret);
+
         return {
           content: [
             {
               type: "text" as const,
-              text: output,
+              text: safeOutput,
             },
           ],
           details: {
@@ -662,10 +741,14 @@ export default function (pi: ExtensionAPI) {
         const stderr = e.stderr ?? "";
         const stdout = e.stdout ?? "";
 
+        // Redact the secret from error output to prevent accidental leaks
+        const safeStdout = redactSecretFromOutput(stdout, secret);
+        const safeStderr = redactSecretFromOutput(stderr, secret);
+
         // Build a diagnostic message
         const diagParts: string[] = [];
-        if (stdout) diagParts.push(stdout);
-        if (stderr) diagParts.push(`stderr: ${stderr.slice(0, 1000)}`);
+        if (safeStdout) diagParts.push(safeStdout);
+        if (safeStderr) diagParts.push(`stderr: ${safeStderr.slice(0, 1000)}`);
         if (diagParts.length === 0) {
           diagParts.push(`Command failed: ${reason}`);
         } else {
@@ -743,7 +826,9 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "List stored secret keys without revealing values",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const keys = auth.list();
+      // auth.list() only returns persisted keys, missing runtime overrides.
+      // Must use allSecretKeys() to include ephemeral session-only secrets.
+      const keys = allSecretKeys();
 
       if (keys.length === 0) {
         return {
@@ -794,6 +879,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "clear_secret",
     label: "Clear Secret",
+    executionMode: "sequential",
     description:
       "Delete a single stored secret by key. Requires the user to type the secret's name " +
       "in a confirmation prompt before deletion proceeds — nothing is deleted by accident. " +
@@ -815,8 +901,8 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const { key } = params;
 
-      // Check existence first
-      if (!auth.has(key)) {
+      // Check existence first — must check both auth.json and runtime overrides
+      if (!secretExists(key)) {
         return {
           content: [
             {
@@ -847,11 +933,14 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Confirmed — remove from both auth.json and runtime overrides
+      // Confirmed — remove from auth.json, runtime overrides, and our tracking set.
+      // auth.remove() only removes from this.data, not from runtimeOverrides,
+      // so we must explicitly call removeRuntimeApiKey() for ephemeral secrets.
       auth.remove(key);
+      auth.removeRuntimeApiKey(key);
       ephemeralSecrets.delete(key);
 
-      const count = auth.list().length;
+      const count = allSecretKeys().length;
       if (count === 0) {
         ctx.ui.setStatus("secret-store", undefined);
       } else {
@@ -877,6 +966,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "forget_secrets",
     label: "Forget All Secrets",
+    executionMode: "sequential",
     description:
       "⚠ IRREVERSIBLE — Clear ALL stored secrets from disk and memory. " +
       "Requires the user to type a long confirmation phrase before anything " +
@@ -894,7 +984,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const keys = auth.list();
+      const keys = allSecretKeys();
 
       if (keys.length === 0) {
         return {
@@ -938,9 +1028,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Confirmed — wipe everything
+      // Confirmed — wipe everything (auth.json, runtime overrides, and tracking)
       for (const key of keys) {
         auth.remove(key);
+        auth.removeRuntimeApiKey(key);
         ephemeralSecrets.delete(key);
       }
 
@@ -1250,6 +1341,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "import_secret",
     label: "Import Secrets",
+    executionMode: "sequential",
     description:
       "Import credentials from a local file into the secret store. " +
       "Supports .env, JSON, and INI-like formats (e.g., ~/.aws/credentials). " +
@@ -1424,7 +1516,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("secrets", {
     description: "List stored secrets (without values)",
     handler: async (_args, ctx) => {
-      const keys = auth.list();
+      const keys = allSecretKeys();
       if (keys.length === 0) {
         ctx.ui.notify("No secrets stored.", "info");
         return;
@@ -1513,7 +1605,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    ctx.ui.setStatus("secret-store", `🔐 ${auth.list().length} secret(s)`);
+    ctx.ui.setStatus("secret-store", `🔐 ${allSecretKeys().length} secret(s)`);
 
     return { stored, errors, format, namespace, deleted, keys, parsedCount: parsed.length, confirmed: true };
   }
