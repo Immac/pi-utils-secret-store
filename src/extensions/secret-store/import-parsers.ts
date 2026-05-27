@@ -256,8 +256,9 @@ export function parseWithTemplate(
     try {
       const skipRe = new RegExp(template.skipPattern, "gm");
       text = text.replace(skipRe, "");
-    } catch (e: any) {
-      result.warnings.push(`Invalid skip pattern "${template.skipPattern}": ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      result.warnings.push(`Invalid skip pattern "${template.skipPattern}": ${msg}`);
     }
   }
 
@@ -278,8 +279,9 @@ export function parseWithTemplate(
       // Avoid infinite loop on zero-length matches
       if (match.index === re.lastIndex) re.lastIndex++;
     }
-  } catch (e: any) {
-    result.warnings.push(`Invalid template pattern: ${e.message}`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    result.warnings.push(`Invalid template pattern: ${msg}`);
   }
 
   return result;
