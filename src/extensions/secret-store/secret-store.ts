@@ -795,7 +795,11 @@ export default function (pi: ExtensionAPI) {
         // Build a diagnostic message
         const diagParts: string[] = [];
         if (safeStdout) diagParts.push(safeStdout);
-        if (safeStderr) diagParts.push(`stderr: ${safeStderr.slice(0, 1000)}`);
+        if (safeStderr) {
+          const stderrTruncated = safeStderr.length > maxBytes;
+          diagParts.push(`stderr: ${safeStderr.slice(0, maxBytes)}` +
+            (stderrTruncated ? `\n\n[stderr truncated to ${maxBytes} bytes]` : ""));
+        }
         if (diagParts.length === 0) {
           diagParts.push(`Command failed: ${reason}`);
         } else {
