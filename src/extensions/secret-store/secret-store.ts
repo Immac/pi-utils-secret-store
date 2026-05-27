@@ -70,6 +70,14 @@ let auth = AuthStorage.create();
 const ephemeralSecrets = new Set<string>();
 
 /**
+ * Track volatile secrets — a subset of ephemeralSecrets that are:
+ * - Auto-cleared when the session ends
+ * - Deletable without confirmation (no confirmDestructiveAction)
+ * - Always runtime-only, never persisted
+ */
+const volatileSecrets = new Set<string>();
+
+/**
  * Return all known secret keys (persisted + ephemeral runtime overrides).
  * AuthStorage.list() only returns keys from auth.json (this.data), missing
  * any secrets stored via setRuntimeApiKey. This helper merges both sources.
@@ -214,8 +222,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    // Nothing to flush — AuthStorage persists via file write on each set()
+    // Clear runtime overrides so volatile + ephemeral secrets don't
+    // persist across sessions. AuthStorage.setRuntimeApiKey() stores
+    // values in an in-memory map that survives the AuthStorage instance.
+    for (const key of allSecretKeys()) {
+      auth.removeRuntimeApiKey(key);
+    }
     ephemeralSecrets.clear();
+    volatileSecrets.clear();
   });
 
   // ===========================================================================
@@ -264,9 +278,17 @@ export default function (pi: ExtensionAPI) {
             "Has no effect on blocked keys — they are NEVER persisted regardless.",
         })
       ),
+      volatile: Type.Optional(
+        Type.Boolean({
+          description:
+            "Mark this secret as volatile — it will be auto-cleared when the session " +
+            "ends and can be deleted without confirmation. Always runtime-only, " +
+            "never persisted to disk. Overrides persist (volatile secrets are NEVER persisted).",
+        })
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { key, prompt: promptText, persist } = params;
+      const { key, prompt: promptText, persist, volatile } = params;
 
       // --- Show context in the prompt ---
       const blocked = isDoNotPersist(key);
@@ -299,23 +321,27 @@ export default function (pi: ExtensionAPI) {
 
       // --- Store via AuthStorage ---
       // Blocked keys are NEVER persisted regardless of the persist parameter.
-      // For non-blocked keys: persist=true or undefined=persist, false=ephemeral.
+      // Volatile overrides persist (volatile is NEVER persisted).
+      // For non-blocked, non-volatile: persist=true or undefined=persist, false=ephemeral.
       let actuallyPersisted: boolean;
 
-      if (blocked) {
-        // Blocked → runtime override only
+      if (blocked || volatile) {
+        // Blocked or volatile → runtime override only
         auth.setRuntimeApiKey(key, value);
         ephemeralSecrets.add(key);
+        if (volatile) volatileSecrets.add(key);
         actuallyPersisted = false;
       } else if (persist === false) {
         // Explicit ephemeral
         auth.setRuntimeApiKey(key, value);
         ephemeralSecrets.add(key);
+        volatileSecrets.delete(key);
         actuallyPersisted = false;
       } else {
         // Persist to auth.json
         auth.set(key, { type: "api_key", key: value });
         ephemeralSecrets.delete(key);
+        volatileSecrets.delete(key);
         actuallyPersisted = true;
       }
 
@@ -324,9 +350,10 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
 
       // --- Summarize (never leak the full value) ---
+      const volatility = volatile ? " (volatile — auto-cleared on session end, no confirmation to delete)" : "";
       const summary = existing
-        ? `Secret "${key}" updated. ${secretSummary(key, value, actuallyPersisted)}`
-        : `Secret "${key}" stored successfully. ${secretSummary(key, value, actuallyPersisted)}`;
+        ? `Secret "${key}" updated. ${secretSummary(key, value, actuallyPersisted)}${volatility}`
+        : `Secret "${key}" stored successfully. ${secretSummary(key, value, actuallyPersisted)}${volatility}`;
 
       return {
         content: [
@@ -617,7 +644,10 @@ export default function (pi: ExtensionAPI) {
 
       const varName = envVarName || "SECRET";
       const isEphemeral = ephemeralSecrets.has(key);
-      const source = isEphemeral ? "runtime override (session-only)" : "auth.json (persisted)";
+      const isVolatile = volatileSecrets.has(key);
+      const source = isEphemeral
+        ? (isVolatile ? "volatile (auto-cleared on session end)" : "runtime override (session-only)")
+        : "auth.json (persisted)";
       const hasStructure = rawHasStructure(key);
       const preview = sanitizeForDisplay(secret);
 
@@ -843,6 +873,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       const lines = keys.map((k) => {
+        if (volatileSecrets.has(k)) {
+          return `  🌪️ ${k} (volatile — session-only, no confirm to delete)`;
+        }
         const persisted = !ephemeralSecrets.has(k);
         const icon = persisted ? "💾" : "🧠";
         const tag = persisted ? "persisted" : "session-only";
@@ -850,7 +883,8 @@ export default function (pi: ExtensionAPI) {
       });
 
       const persistedCount = keys.filter((k) => !ephemeralSecrets.has(k)).length;
-      const ephemeralCount = keys.filter((k) => ephemeralSecrets.has(k)).length;
+      const ephemeralCount = keys.filter((k) => ephemeralSecrets.has(k) && !volatileSecrets.has(k)).length;
+      const volatileCount = keys.filter((k) => volatileSecrets.has(k)).length;
 
       return {
         content: [
@@ -859,14 +893,19 @@ export default function (pi: ExtensionAPI) {
             text:
               `**${keys.length} secret(s) stored:**\n` +
               lines.join("\n") +
-              `\n\n_${persistedCount} persisted to disk, ${ephemeralCount} session-only (not persisted)_`,
+              `\n\n_${persistedCount} persisted to disk, ${ephemeralCount} session-only, ${volatileCount} volatile_`,
           },
         ],
         details: {
           count: keys.length,
           persisted: persistedCount,
           ephemeral: ephemeralCount,
-          secrets: keys.map((k) => ({ key: k, persisted: !ephemeralSecrets.has(k) })),
+          volatile: volatileCount,
+          secrets: keys.map((k) => ({
+            key: k,
+            persisted: !ephemeralSecrets.has(k),
+            volatile: volatileSecrets.has(k),
+          })),
         },
       };
     },
@@ -914,23 +953,26 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Require user to type the secret's name as confirmation
-      const confirmed = await confirmDestructiveAction(
-        ctx,
-        `Type "${key}" to confirm deletion:`,
-        key
-      );
+      // Volatile secrets can be deleted without confirmation
+      if (!volatileSecrets.has(key)) {
+        // Require user to type the secret's name as confirmation
+        const confirmed = await confirmDestructiveAction(
+          ctx,
+          `Type "${key}" to confirm deletion:`,
+          key
+        );
 
-      if (!confirmed) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Deletion cancelled — confirmation string did not match. Secret "${key}" was not removed.`,
-            },
-          ],
-          details: { removed: false, key, reason: "cancelled" },
-        };
+        if (!confirmed) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Deletion cancelled — confirmation string did not match. Secret "${key}" was not removed.`,
+              },
+            ],
+            details: { removed: false, key, reason: "cancelled" },
+          };
+        }
       }
 
       // Confirmed — remove from auth.json, runtime overrides, and our tracking set.
@@ -939,6 +981,7 @@ export default function (pi: ExtensionAPI) {
       auth.remove(key);
       auth.removeRuntimeApiKey(key);
       ephemeralSecrets.delete(key);
+      volatileSecrets.delete(key);
 
       const count = allSecretKeys().length;
       if (count === 0) {
@@ -1033,6 +1076,7 @@ export default function (pi: ExtensionAPI) {
         auth.remove(key);
         auth.removeRuntimeApiKey(key);
         ephemeralSecrets.delete(key);
+        volatileSecrets.delete(key);
       }
 
       ctx.ui.setStatus("secret-store", undefined);
@@ -1522,9 +1566,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const lines = keys.map((k) => {
+        if (volatileSecrets.has(k)) return `  🌪️ ${k}`;
         const persisted = !ephemeralSecrets.has(k);
-        const icon = persisted ? "💾" : "🧠";
-        return `  ${icon} ${k}`;
+        return `  ${persisted ? "💾" : "🧠"} ${k}`;
       });
       ctx.ui.notify(`🔐 ${keys.length} secret(s):\n${lines.join("\n")}`, "info");
     },
