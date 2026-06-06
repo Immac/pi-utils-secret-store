@@ -52,22 +52,30 @@ has no effect on blocked keys.
 
 ### `ask_secret(key, prompt, persist?)`
 
-Prompt user via masked dialog — all chars display as `•`. Returns sanitized
-summary (`fi****en`) to agent; full value available via `get_secret`.
+Prompt user via masked dialog — all chars display as `•`. Returns only the key
+name and persistence status. **Never reveals any part of the value** (no prefix,
+no suffix, no character count). The value is available for `with_secret`.
 
 - Blocked keys → always in-memory (🧠). Non-blocked → persisted by default (💾).
 - `persist: false` keeps a non-blocked key memory-only. `persist: true` = default.
+- Result text: `Stored secret "github_token". auth.json.` or `session-only.`
 
 ### `get_secret(key)`
 
-Returns stored value in `content` — agent can use directly. Returns "not found"
-if key doesn't exist.
+Confirms a secret is accessible. **Never reveals any part of the value** —
+no prefix, no suffix, no character count. The secret is resolved internally to
+verify it can be used, but only `with_secret` injects it into a command.
+Returns "not found" if key doesn't exist, or "retrieved" with persistence status.
 
-### `with_secret(key, command, envVarName?, timeout?)`
+### `with_secret(key, command, envVarName?, timeout?, validate?)`
 
 Runs a shell command with the secret injected as an environment variable.
 The value is never exposed in tool content, session history, or bash history.
 Reference via `$SECRET` (or `$envVarName` if set).
+
+Use `validate: true` to dry-run — checks the secret is accessible and reports
+its type (plain string, structured) and source (auth.json, session-only)
+**without revealing any part of the value**.
 
 ### `list_secrets()`
 
@@ -243,7 +251,7 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 ├───────────────────────────────────────────────────────────┤
 │                                                           │
 │  ask_secret(key, prompt, persist?)                        │
-│    → masked dialog → store → sanitized summary to agent   │
+│    → masked dialog → store → key + status only, never value│
 │  get_secret(key)         → metadata only; use with_secret │
 │  with_secret(key, cmd)   → $SECRET env var, never in text │
 │  list_secrets()          → keys with 💾/🧠 icons           │

@@ -25,7 +25,7 @@
 | Tool | Description |
 |---|---|
 | `ask_secret` | Prompt the user for a secret via TUI dialog, store in `AuthStorage` |
-| `get_secret` | Retrieve metadata (key, length) — value cached in memory, **never in `content`** |
+| `get_secret` | Check a secret is accessible — **never reveals any part of the value, not even length** |
 | `with_secret` | Run a shell command with secret injected as `$SECRET` env var — **never in session history** |
 | `list_secrets` | List stored keys + persistence status (disk vs session-only) |
 | `clear_secret` | Delete one secret (requires typed name to confirm) |
@@ -60,10 +60,10 @@ pi install /path/to/secret-store
 User: "Set up the database with my credentials"
 
 LLM → ask_secret(key="db_password", prompt="Enter DB password:")
-  → TUI dialog → user pastes password → "Secret 'db_password' stored"
+  → TUI dialog → user pastes password → "Stored secret 'db_password'. auth.json."
 
 LLM → get_secret(key="db_password")
-  → "Secret 'db_password' (12 chars) retrieved. Use with_secret to use it."
+  → "Secret 'db_password' (auth.json) retrieved. Use with_secret to use it."
 
 LLM → with_secret(key="db_password", command="mysql -u root -p$SECRET < schema.sql")
   → Secret injected as env var, never in content. Output returned.
@@ -149,13 +149,14 @@ import_secret(path="server.cfg", template={
 
 ```
 get_secret("db_password")
-  → value cached in memory Map
-  → content: "Secret 'db_password' (12 chars) retrieved"
+  → resolves value internally to verify accessibility
+  → content: "Secret 'db_password' (auth.json) retrieved"
+  → ✓ no value, no prefix, no length in content
   → ✓ session file has no value
   → ✓ compaction has no value
 
 with_secret(key="db_password", command="mysql -u root -p$SECRET")
-  → looks up cached value
+  → looks up value via AuthStorage
   → child_process.exec with env: { SECRET: "actual-value" }
   → ✓ no secret in tool content, session file, or bash history
   → ✓ no secret in /proc/*/cmdline (env only, not args)

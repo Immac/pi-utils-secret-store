@@ -174,16 +174,16 @@ function errorMessage(err: unknown, fallback?: string): string {
   return fallback ?? String(err);
 }
 
-function sanitizeForDisplay(value: string): string {
-  if (value.length <= 4) return "****";
-  return value.slice(0, 2) + "****" + value.slice(-2);
-}
-
-function secretSummary(key: string, value: string, persisted: boolean): string {
-  const preview = sanitizeForDisplay(value);
-  const lengthHint = `(${value.length} chars)`;
-  const storage = persisted ? "persisted to auth.json" : "in-memory only (not persisted)";
-  return `Secret "${key}" ${lengthHint} stored (${storage}, value: ${preview})`;
+/**
+ * Describe persistence status for a secret in the most terse way possible.
+ *
+ * Policy: NOTHING about the secret value is revealed — not even a prefix,
+ * suffix, or character count. The LLM only needs to know whether the secret
+ * was stored and whether it survives a reload (persisted vs session-only).
+ * The key name alone is enough context for subsequent with_secret calls.
+ */
+function storageTag(persisted: boolean): string {
+  return persisted ? "auth.json" : "session-only";
 }
 
 /**
@@ -349,24 +349,24 @@ export default function (pi: ExtensionAPI) {
       const count = allSecretKeys().length;
       ctx.ui.setStatus("secret-store", `🔐 ${count} secret(s)`);
 
-      // --- Summarize (never leak the full value) ---
-      const volatility = volatile ? " (volatile — auto-cleared on session end, no confirmation to delete)" : "";
-      const summary = existing
-        ? `Secret "${key}" updated. ${secretSummary(key, value, actuallyPersisted)}${volatility}`
-        : `Secret "${key}" stored successfully. ${secretSummary(key, value, actuallyPersisted)}${volatility}`;
+      // --- Return minimal result — NEVER reveal any part of the value ---
+      // No value preview (not even first/last 2 chars), no character count,
+      // no length hint. The LLM only needs the key name and persistence status.
+      const volatility = volatile ? " (volatile — auto-cleared on session end, no confirmation required to delete)" : "";
+      const verb = existing ? "Updated" : "Stored";
+      const storage = storageTag(actuallyPersisted);
 
       return {
         content: [
           {
             type: "text" as const,
-            text: summary + blockReason + overwriteHint,
+            text: `${verb} secret "${key}". ${storage}.${volatility}` + blockReason + overwriteHint,
           },
         ],
         details: {
           stored: true,
           key,
           persisted: actuallyPersisted,
-          valueLength: value.length,
         },
       };
     },
@@ -422,6 +422,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       // --- Structure-only mode (no resolution, no value exposure) ---
+      //
+      // Policy: NEVER leak any part of the secret value or its length.
+      // The LLM only needs to know the storage TYPE and persistence mode
+      // to decide how to use with_secret.
       if (showStructure) {
         const raw = secretGet(key);
         const isEphemeral = ephemeralSecrets.has(key);
@@ -429,28 +433,20 @@ export default function (pi: ExtensionAPI) {
 
         let typeLabel = "unknown";
         let schemeHint = "unknown";
-        let prefixHint = "none";
-        let valueLengthHint = "unknown";
 
         if (isEphemeral) {
           // Runtime overrides are plain strings, not stored as AuthCredential
           typeLabel = "plain string (runtime override)";
           schemeHint = "direct value — use as-is";
-          valueLengthHint = "(resolved at runtime)";
+
         } else if (raw && typeof raw === "object" && raw !== null) {
           const obj = raw as Record<string, unknown>;
           const t = obj.type;
           typeLabel = typeof t === "string" ? t : "object (no type field)";
-          if (obj.key) {
-            const keyVal = String(obj.key);
-            valueLengthHint = String(keyVal.length);
-            if (keyVal.length > 4) {
-              prefixHint = `key starts with "${sanitizeForDisplay(keyVal)}"`;
-            }
-          }
           if (t === "api_key") {
             schemeHint = "Bearer token or similar — use in Authorization header";
           } else if (t === "oauth") {
+            // Show expiration but NOT the value or its length
             const exp = obj.expires;
             const expStr = typeof exp === "number"
               ? `expires ${new Date(exp).toISOString()}`
@@ -463,8 +459,6 @@ export default function (pi: ExtensionAPI) {
           `Secret "${key}" structure:`,
           `  • Type: ${typeLabel}`,
           `  • Auth scheme: ${schemeHint}`,
-          `  • Value length: ${valueLengthHint}`,
-          `  • Prefix hint: ${prefixHint}`,
           `  • Source: ${source}`,
         ];
 
@@ -476,8 +470,6 @@ export default function (pi: ExtensionAPI) {
             structure: {
               type: typeLabel,
               scheme: schemeHint,
-              valueLength: valueLengthHint,
-              prefix: prefixHint,
               source,
             },
           },
@@ -498,19 +490,19 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const length = value.length;
       const isEphemeral = ephemeralSecrets.has(key);
-      const tag = isEphemeral ? "session-only" : "persisted";
+      const tag = storageTag(!isEphemeral);
 
+      // NEVER leak any part of the value — no length, no prefix.
       return {
         content: [
           {
             type: "text" as const,
-            text: `Secret "${key}" (${length} chars, ${tag}) retrieved. Use with_secret(key="${key}", command="...") to run a command with it injected as \\$SECRET.` +
+            text: `Secret "${key}" (${tag}) retrieved. Use with_secret(key="${key}", command="...") to run a command with it injected as \\$SECRET.` +
               (rawHasStructure(key) ? `\n\nNote: This secret is stored as a structured object. with_secret automatically resolves it — \$SECRET will contain just the key value, not the wrapper.` : ""),
           },
         ],
-        details: { found: true, key, valueLength: length, persisted: !isEphemeral },
+        details: { found: true, key, persisted: !isEphemeral },
       };
     },
     renderCall(args, theme, _context) {
@@ -522,7 +514,7 @@ export default function (pi: ExtensionAPI) {
     },
     renderResult(result, _options, theme, _context) {
       const details = result.details as
-        | { found: boolean; key: string; valueLength?: number }
+        | { found: boolean; key: string }
         | undefined;
 
       if (!details?.found) {
@@ -532,14 +524,9 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const lengthHint = ` (${details.valueLength} chars)`;
-      const preview = "•".repeat(Math.min(details.valueLength ?? 0, 16));
       return new Text(
         theme.fg("success", "✓ ") +
         theme.fg("accent", details.key) +
-        theme.fg("muted", lengthHint) +
-        " " +
-        theme.fg("dim", preview) +
         "   " +
         theme.fg("muted", "→ ready for with_secret"),
         0, 0
@@ -649,9 +636,9 @@ export default function (pi: ExtensionAPI) {
         ? (isVolatile ? "volatile (auto-cleared on session end)" : "runtime override (session-only)")
         : "auth.json (persisted)";
       const hasStructure = rawHasStructure(key);
-      const preview = sanitizeForDisplay(secret);
 
       // --- Validate mode: dry-run, no command execution ---
+      // NEVER leak any part of the value — no prefix, no suffix, no length.
       if (validate) {
         let typeDesc = "plain string";
         if (hasStructure) {
@@ -665,8 +652,6 @@ export default function (pi: ExtensionAPI) {
         const lines = [
           `✓ Secret "${key}" is accessible via \$${varName}`,
           `  • Type: ${typeDesc}`,
-          `  • Length: ${secret.length} chars`,
-          `  • Prefix: ${preview}`,
           `  • Source: ${source}`,
           `  • Resolution: ${hasStructure ? "auto-resolved from structured object" : "direct"}`,
           ``,
@@ -682,7 +667,6 @@ export default function (pi: ExtensionAPI) {
             envVar: varName,
             exitCode: 0,
             mode: "validate",
-            secretLength: secret.length,
             source,
             hasStructure,
           },
