@@ -585,7 +585,7 @@ export default function (pi: ExtensionAPI) {
       ),
       timeout: Type.Optional(
         Type.Number({
-          description: "Timeout in milliseconds for the command (default: 60000).",
+          description: "Timeout in seconds for the command (default: 60).",
         })
       ),
       validate: Type.Optional(
@@ -691,7 +691,7 @@ export default function (pi: ExtensionAPI) {
       const maxBytes = 50 * 1024;
       const maxLines = 2000;
 
-      const effectiveTimeout = timeout ?? 60_000;
+      const effectiveTimeout = (timeout ?? 60) * 1000;
 
       try {
         const { stdout, stderr } = await execAsync(command, {
@@ -742,7 +742,7 @@ export default function (pi: ExtensionAPI) {
         if (isAborted) {
           reason = "tool execution was aborted (session may have been interrupted)";
         } else if (isExecTimeout) {
-          reason = `timed out after ${effectiveTimeout}ms`;
+          reason = `timed out after ${effectiveTimeout / 1000}s`;
         } else if (isKilled && signalName) {
           reason = `killed by signal ${signalName}`;
         } else if (isKilled) {
