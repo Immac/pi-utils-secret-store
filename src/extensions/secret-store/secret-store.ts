@@ -288,8 +288,8 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Prompt the user for a secret (password, API key, token) and store it securely",
     promptGuidelines: [
       "Use ask_secret when you need a credential, password, API key, or token the user hasn't provided yet.",
-      "Use get_secret to retrieve a previously stored secret. It caches the value in memory so you can use it with with_secret — the raw value never enters the conversation history.",
-      "Use with_secret to run a command with a cached secret injected as an environment variable. This avoids leaking the value into tool results, session files, or bash history.",
+      "Use get_secret to check a previously stored secret is accessible. Then use with_secret to run a command with it — the raw value never enters the conversation history.",
+      "Use with_secret to run a command with a stored secret injected as an environment variable. This avoids leaking the value into tool results, session files, or bash history.",
       "Use list_secrets to see what secrets are already stored.",
       "Do NOT ask for secrets via bash or read tool — always use ask_secret for safe handling.",
     ],
@@ -415,10 +415,12 @@ export default function (pi: ExtensionAPI) {
     name: "get_secret",
     label: "Get Secret",
     description:
-      "Retrieve a previously stored secret by its key. The secret is cached " +
-      "in memory so you can use it with with_secret — the raw value is never " +
-      "exposed in tool result content. If the secret doesn't exist, you'll " +
-      "need to use ask_secret first.\n\n" +
+      "Retrieve a previously stored secret by its key for subsequent use with " +
+      "with_secret. The resolved value is never exposed in tool result content. " +
+      "If the secret doesn't exist, use ask_secret first.\n\n" +
+      "Secrets are resolved as literal values — \$VARIABLE is NOT interpolated " +
+      "and !command is NOT executed. This means passwords containing \$ will " +
+      "work correctly.\n\n" +
       "Secrets may be stored as structured objects (e.g., " +
       '{"type": "api_key", "key": "..."}) rather than plain strings. ' +
       "Use showStructure=true to inspect the secret's metadata (type, auth scheme, " +
@@ -580,21 +582,24 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     description:
       "Run a shell command with a previously stored secret injected as an " +
-      "environment variable. The secret is retrieved from AuthStorage " +
-      "(~/.pi/agent/auth.json) and injected directly into the subprocess " +
-      "environment. It never appears in tool result content, session history, " +
-      "TUI display, or bash history.\n\n" +
+      "environment variable. The secret is resolved as a literal value — " +
+      "\$VARIABLE is NOT interpreted as an env var, and !command is NOT " +
+      "executed. This prevents secrets containing \$ from silently failing.\n\n" +
+      "The secret is injected directly into the subprocess environment. " +
+      "It never appears in tool result content, session history, TUI display, " +
+      "or bash history. stdout and stderr are automatically scanned and " +
+      "any occurrence of the secret is replaced with [REDACTED].\n\n" +
       "The secret is available as \\$SECRET inside the command by default. " +
       "Use envVarName to pick a different variable name.\n\n" +
       "**Structured secrets:** Secrets may be stored as objects like " +
       '{"type": "api_key", "key": "..."} rather than plain strings. ' +
       "The tool automatically resolves these — \\$SECRET always contains " +
       "just the resolved string value, not the wrapper object.\n\n" +
-      "**Validate mode:** Set validate=true to check a secret's characteristics " +
+      "**Validate mode:** Set validate=true to check a secret's accessibility " +
       "without executing any command (safe dry-run).",
     promptSnippet: "Run a command with a cached secret injected as $SECRET env var",
     promptGuidelines: [
-      "Use with_secret after get_secret to use a secret in a command without leaking it into conversation history or bash history.",
+      "Use with_secret after get_secret to use a stored secret in a command without leaking it into conversation history or bash history.",
       "The secret is available as $SECRET inside the command by default. Set envVarName to change the variable name.",
       "Secrets may be stored as structured objects (e.g., {type, key}); with_secret resolves them automatically.",
       "Use validate=true to inspect a secret's metadata without executing any command.",
@@ -603,7 +608,9 @@ export default function (pi: ExtensionAPI) {
       key: Type.String({
         description:
           "The key of the secret to use. Must have been stored via ask_secret first. " +
-          "AuthStorage resolves !command syntax if the secret was stored as a shell command.",
+          "Secrets are resolved as literal values — \$VARIABLE is not interpolated " +
+          "and !command is not executed. For !command resolution, use manually " +
+          "edited auth.json entries (fallback path).",
       }),
       command: Type.Optional(
         Type.String({
@@ -628,9 +635,9 @@ export default function (pi: ExtensionAPI) {
       validate: Type.Optional(
         Type.Boolean({
           description:
-            "If true, resolve the secret and report its metadata (type, length, prefix, source) " +
-            "without executing any command. Use this as a safe dry-run to verify a secret " +
-            "is accessible before using it in a real command. Default: false.",
+            "If true, resolve the secret and report its type and source " +
+            "without executing any command. Use this as a safe dry-run to verify " +
+            "a secret is accessible before using it in a real command. Default: false.",
         })
       ),
     }),

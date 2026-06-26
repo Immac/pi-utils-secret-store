@@ -3,8 +3,8 @@ name: secret-store-guide
 description: >
   Tutorial and reference for the Secret Store pi extension. Teaches safe credential
   management — prompting users for secrets (passwords, API keys, tokens), storing
-  them securely with optional persistence, and retrieving on demand. Covers all 7
-  tools, the absolute do-not-persist blocklist, platform-native backends, common
+  them securely with optional persistence, and retrieving on demand. Covers all
+  tools, the absolute do-not-persist blocklist, literal secret resolution, common
   workflows, and security best practices. Load this skill when you need to manage
   credentials interactively for a user, or when the secret-store extension is
   installed and you want to understand its full capabilities.
@@ -63,14 +63,22 @@ no suffix, no character count). The value is available for `with_secret`.
 ### `get_secret(key)`
 
 Confirms a secret is accessible. **Never reveals any part of the value** —
-no prefix, no suffix, no character count. The secret is resolved internally to
-verify it can be used, but only `with_secret` injects it into a command.
+no prefix, no suffix, no character count. The secret is resolved as a
+**literal value** — \$VARIABLE is NOT interpolated and !command is NOT
+executed. This means passwords containing \$ will work correctly.
 Returns "not found" if key doesn't exist, or "retrieved" with persistence status.
+
+Use `showStructure=true` to inspect a secret's storage metadata (type, auth
+scheme, source) without exposing the raw value. Useful before calling
+`with_secret` to understand how the secret is structured.
 
 ### `with_secret(key, command, envVarName?, timeout?, validate?)`
 
 Runs a shell command with the secret injected as an environment variable.
-The value is never exposed in tool content, session history, or bash history.
+The secret is resolved as a **literal value** — \$VARIABLE is NOT
+interpolated and !command is NOT executed. The value is never exposed in
+tool content, session history, or bash history. stdout and stderr are
+automatically scanned and the secret is replaced with [REDACTED].
 Reference via `$SECRET` (or `$envVarName` if set).
 
 Use `validate: true` to dry-run — checks the secret is accessible and reports
@@ -94,9 +102,10 @@ secrets from disk and memory. No undo.
 
 ### `get_secret_store_path()` / `get_active_backend()`
 
-Return active backend name. Possible values: `secret-service` (Linux),
-`macos-keychain` (macOS), `windows-credential-manager` (Win),
-`encrypted-file` (fallback, AES-256-GCM).
+- `get_secret_store_path()` — returns the file path to the active auth storage
+  (`~/.pi/agent/auth.json`)
+- `get_active_backend()` — returns `AuthStorage (auth.json)` — PI's built-in
+  credential store backed by a JSON file with 0600 permissions.
 
 ### `import_secret(path, template?)`
 
@@ -129,7 +138,7 @@ Remove a previously registered template by name.
 | Command | Action |
 |---------|--------|
 | `/secrets` | List stored keys (interactive) |
-| `/secret-path` | Show active backend name |
+| `/secret-path` | Show the secret store file path |
 | `/secret-import <path>` | Import credentials from a file interactively |
 
 ---
@@ -234,12 +243,11 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 | Symptom | Cause / Fix |
 |---------|-------------|
 | No dialog | Not in interactive mode (`--print`/`--json`). Falls back to unmasked `ui.input()`. |
-| Secret lost on restart | Blocked key (🧠) is ephemeral. Or backend changed — check `get_active_backend()`. |
 | "Not found" but stored | Was it blocked? Was it cleared in a prior session? Run `list_secrets()`. |
-| Encrypted file broken | Machine-id changed (containers)? `.pi/agent/` must be `0700`, `secrets.enc` `0600`. Both files (`secrets.enc` + `.salt`) required. |
+| Encrypted file broken | `~/.pi/agent/auth.json` must be `0600`. Use `get_active_backend()` to check. |
 | Accidental wipe | Confirmation required to wipe — user typed the phrase. No undo. Re-enter credentials. |
 
-**Audit checklist:** `list_secrets()` shows only expected keys · Blocked keys show 🧠 · `secrets.enc` permissions `0600` · `~/.pi/agent/` permissions `0700` · No secrets visible in logs/errors.
+**Audit checklist:** `list_secrets()` shows only expected keys · Blocked keys show 🧠 · `auth.json` permissions `0600` · `~/.pi/agent/` permissions `0700` · No secrets visible in logs/errors.
 
 ---
 
@@ -260,8 +268,8 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 │  import_secret(path)     → bulk import .env/json/INI      │
 │  import_secret_template_add / list / remove               │
 │    → custom regex templates for non-standard formats      │
-│  get_secret_store_path() → backend name                   │
-│  get_active_backend()    → backend name only              │
+│  get_secret_store_path() → file path (auth.json)          │
+│  get_active_backend()    → AuthStorage (auth.json)       │
 │                                                           │
 │  🧠 = ephemeral (session)    💾 = persisted (survives)    │
 │  🔒 Blocked keys NEVER persisted (sudo, password, token…) │
