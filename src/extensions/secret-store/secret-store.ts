@@ -203,6 +203,41 @@ function rawHasStructure(key: string): boolean {
   return false;
 }
 
+/**
+ * Resolve a secret to its literal string value, bypassing AuthStorage's
+ * resolveConfigValue (which interprets \$VARIABLE as env var references
+ * and \!command as shell commands).
+ *
+ * Resolution order:
+ *  1. Runtime override (setRuntimeApiKey) — returned as-is (plain string)
+ *  2. Persisted api_key credential — extracts .key as a literal value
+ *  3. Fall back to auth.getApiKey(key) — handles OAuth, !command, env vars
+ *
+ * Returns undefined if the secret doesn't exist or can't be resolved.
+ */
+async function resolveSecretLiteral(key: string): Promise<string | undefined> {
+  // Runtime overrides are stored as plain strings — return as-is.
+  const runtimeKey = ephemeralSecrets.has(key);
+  if (runtimeKey) {
+    // Check runtimeOverrides first (fast, no I/O)
+    // We can't access auth.runtimeOverrides directly, but setRuntimeApiKey
+    // stores in AuthStorage.runtimeOverrides which getApiKey checks first.
+    // For runtime overrides, getApiKey returns the value directly without
+    // going through resolveConfigValue (see auth-storage.js).
+    return auth.getApiKey(key);
+  }
+
+  // Persisted api_key credential — extract literal .key value.
+  const cred = auth.get(key);
+  if (cred && typeof cred === "object" && (cred as Record<string, unknown>).type === "api_key") {
+    const k = (cred as Record<string, string>).key;
+    if (typeof k === "string" && k.length > 0) return k;
+  }
+
+  // Fallback: OAuth, !command, env var — goes through resolveConfigValue
+  return auth.getApiKey(key);
+}
+
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
@@ -476,14 +511,15 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // --- Resolve the actual value — this runs !commands if applicable ---
-      const value = await auth.getApiKey(key);
+      // --- Resolve the actual value as a literal — bypass resolveConfigValue
+      // to avoid interpreting $VARIABLE or !command in user-provided secrets ---
+      const value = await resolveSecretLiteral(key);
       if (value === undefined) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Secret "${key}" exists but could not be resolved. If it uses a !command, check that the command works.`,
+              text: `Secret "${key}" could not be resolved. Use ask_secret(key="${key}", prompt="...") to store it.`,
             },
           ],
           details: { found: false, key, reason: "resolution_failed" },
@@ -541,6 +577,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "with_secret",
     label: "With Secret",
+    executionMode: "sequential",
     description:
       "Run a shell command with a previously stored secret injected as an " +
       "environment variable. The secret is retrieved from AuthStorage " +
@@ -615,14 +652,15 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Resolve the actual value — runs !commands if applicable
-      const secret = await auth.getApiKey(key);
+      // Resolve the actual value as a literal — bypass resolveConfigValue
+      // to avoid interpreting $VARIABLE or !command in user-provided secrets.
+      const secret = await resolveSecretLiteral(key);
       if (secret === undefined) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Secret "${key}" exists but could not be resolved. If it uses a !command, check that the command works.`,
+              text: `Secret "${key}" could not be resolved. Use ask_secret(key="${key}", prompt="...") to store it.`,
             },
           ],
           details: { executed: false, key, reason: "resolution_failed" },
@@ -710,8 +748,9 @@ export default function (pi: ExtensionAPI) {
             `\n\n[Output truncated: ${Math.min(lines.length, maxLines)} of ${lines.length} lines]`
           : stdout;
 
-        // Redact the secret from output to prevent accidental leaks
+        // Redact the secret from output and stderr to prevent accidental leaks
         const safeOutput = redactSecretFromOutput(output, secret);
+        const safeStderr = redactSecretFromOutput(stderr ?? "", secret);
 
         return {
           content: [
@@ -725,7 +764,7 @@ export default function (pi: ExtensionAPI) {
             key,
             envVar: varName,
             exitCode: 0,
-            stderr,
+            stderr: safeStderr,
             truncated,
           },
         };
@@ -791,7 +830,7 @@ export default function (pi: ExtensionAPI) {
             killed: isKilled,
             signal: signalName,
             reason,
-            stderr,
+            stderr: safeStderr,
           },
         };
       }

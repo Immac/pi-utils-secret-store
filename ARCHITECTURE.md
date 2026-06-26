@@ -98,7 +98,14 @@ function isDoNotPersist(key: string): boolean {
 
 Blocked keys are always stored via `setRuntimeApiKey()` regardless of the `persist` or `volatile` parameter. The `persist: true` override is explicitly ignored for blocked keys — this is intentional and non-negotiable.
 
-### 4. Confirmation-Only Destructive Operations
+### 4. Sequential Execution for Tool Safety
+
+All user-interactive tools (`ask_secret`, `clear_secret`, `forget_secrets`, `import_secret`) set
+`executionMode: "sequential"` to prevent parallel execution races on the shared TUI
+`editorContainer`. `with_secret` is also sequential to prevent output interleaving.
+The agent loop detects any sequential tool in a batch and executes all tools one at a time.
+
+### 5. Confirmation-Only Destructive Operations
 
 Three tools require user interaction:
 
@@ -109,11 +116,12 @@ Three tools require user interaction:
 | `forget_secrets()` | User types a random affirmation phrase | `confirmDestructiveAction(ctx, prompt, phrase)` |
 | `import_secret(path)` | User confirms credential list, then optional delete | `ctx.ui.confirm(title, message)` |
 
-These tools all set `executionMode: "sequential"` to prevent parallel execution races on the shared `editorContainer`. The agent loop detects sequential tools and executes them one at a time.
+### 6. Output Redaction
 
-### 5. Output Redaction
-
-After running a command, `with_secret` automatically scans `stdout` and `stderr` for the exact secret string and replaces it with `[REDACTED]`. This catches accidental leakage from verbose tools (e.g., `curl` logging the auth header).
+After running a command, `with_secret` automatically scans `stdout` and `stderr` (both in tool
+content and the `details` result object) for the exact secret string and replaces it with
+`[REDACTED]`. This catches accidental leakage from verbose tools (e.g., `curl` logging the
+auth header) on both success and error output paths.
 
 ```typescript
 export function redactSecretFromOutput(output: string, secret: string): string {
@@ -122,7 +130,41 @@ export function redactSecretFromOutput(output: string, secret: string): string {
 }
 ```
 
-### 6. Format Detection for Import
+### 7. Literal Secret Resolution (resolveConfigValue Bypass)
+
+Secrets stored via `ask_secret` are resolved as **literal values** — the extension does
+NOT pass them through AuthStorage's `resolveConfigValue`, which would interpret `$VARIABLE`
+as environment variable references and `!command` as shell execution.
+
+The `resolveSecretLiteral()` helper uses a three-tier resolution:
+
+1. **Runtime override** → returned as-is (plain string, no interpolation)
+2. **Persisted `api_key` credential** → extracts `.key` as a literal value
+3. **OAuth / `!command` / env var** → falls back to `auth.getApiKey()` (preserves `resolveConfigValue`)
+
+This means you can safely store passwords and tokens containing `$`, `!`, or `${}`
+characters — they will be injected exactly as-entered into the command environment.
+
+```typescript
+async function resolveSecretLiteral(key: string): Promise<string | undefined> {
+  // Runtime override — returned as-is
+  if (ephemeralSecrets.has(key)) return auth.getApiKey(key);
+
+  // Persisted api_key — literal extraction
+  const cred = auth.get(key);
+  if (cred?.type === "api_key" && typeof cred.key === "string" && cred.key.length > 0) {
+    return cred.key;
+  }
+
+  // Fallback: OAuth, !command, env var
+  return auth.getApiKey(key);
+}
+```
+
+Secrets stored this way no longer execute `!echo pwned` as a shell command,
+interpolate `${HOME}` into paths, or fail on `$` characters.
+
+### 8. Format Detection for Import
 
 The `import_secret` tool auto-detects file format from the path:
 
@@ -166,10 +208,16 @@ Agent: ask_secret(key="github_token", prompt="Enter your GitHub PAT")
 Agent: with_secret(key="github_token", command="curl -H 'Authorization: Bearer $SECRET' ...")
   │
   ├─ secretExists("github_token")? → Yes
-  ├─ auth.getApiKey("github_token") → "ghp_abc123"
+  ├─ resolveSecretLiteral("github_token")
+  │    ├─ ephemeral? → No
+  │    ├─ api_key literal? → Yes, .key = "ghp_abc123"
+  │    └─ returned directly (bypasses resolveConfigValue)
   │
   ├─ execAsync("curl ...", { env: { SECRET: "ghp_abc123" }, cwd, timeout, signal })
   │     ✓ Value only in child process environment, never in tool output
+  │
+  ├─ stdout + stderr both redacted via redactSecretFromOutput()
+  │     ✓ Accidental leakage caught on both content and details paths
   │
   └─ Result: stdout from curl, with any accidental value occurrences redacted
 ```

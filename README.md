@@ -26,7 +26,7 @@
 |---|---|
 | `ask_secret` | Prompt the user for a secret via TUI dialog, store in `AuthStorage` |
 | `get_secret` | Check a secret is accessible — **never reveals any part of the value, not even length** |
-| `with_secret` | Run a shell command with secret injected as `$SECRET` env var — **never in session history** |
+| `with_secret` | Run a shell command with secret injected as `$SECRET` env var (sequential execution) — **never in session history** |
 | `list_secrets` | List stored keys + persistence status (disk vs session-only) |
 | `clear_secret` | Delete one secret (requires typed name to confirm) |
 | `forget_secrets` | Wipe ALL secrets (requires typed affirmation phrase) |
@@ -156,11 +156,23 @@ get_secret("db_password")
   → ✓ compaction has no value
 
 with_secret(key="db_password", command="mysql -u root -p$SECRET")
-  → looks up value via AuthStorage
+  → looks up value via resolveSecretLiteral (literal path — bypasses resolveConfigValue)
   → child_process.exec with env: { SECRET: "actual-value" }
+  → stdout + stderr both redacted (content AND details)
   → ✓ no secret in tool content, session file, or bash history
   → ✓ no secret in /proc/*/cmdline (env only, not args)
 ```
+
+### Literal resolution (no interpolation)
+
+Secrets are stored and retrieved as **literal values**. `$VARIABLE` in a secret is not
+interpolated, and `!command` is not executed. This prevents:
+- Secrets containing `$` from silently failing (e.g., `pass$word123`)
+- Secrets starting with `!` from executing as shell commands
+- `${HOME}`-style template references from leaking environment info
+
+If you need shell-command resolution (e.g., `!pass show api/key`), manually edit
+`~/.pi/agent/auth.json` — the fallback path preserves this feature for explicit use.
 
 ### Blocklist
 
