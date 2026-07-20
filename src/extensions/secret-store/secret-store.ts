@@ -1,8 +1,8 @@
 /**
  * Secret Store — Safe secret management for pi agents.
  *
- * Built on PI's AuthStorage (~/.pi/agent/auth.json), which supports:
- * - Persistent API key storage with 0600-permission JSON
+ * Built on a simple JSON file store (~/.pi/agent/secrets.json) with:
+ * - Persistent secret storage with 0600-permission JSON
  * - In-memory runtime overrides via setRuntimeApiKey()
  * - Shell command resolution via !prefix (e.g. "!pass show ...")
  *
@@ -30,7 +30,8 @@ import { resolve, join, dirname } from "node:path";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { AuthStorage, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { SimpleSecretStore } from "./simple-store.js";
 import { confirmDestructiveAction } from "./confirm.js";
 import {
   detectFormat,
@@ -50,18 +51,16 @@ const execAsync = promisify(execCb);
 // =============================================================================
 
 /**
- * AuthStorage-backed credential store.
- * Reads/writes ~/.pi/agent/auth.json with 0600 permissions.
- * Also checks environment variables and supports !command shell resolution.
+ * SimpleSecretStore-backed credential store.
+ * Reads/writes ~/.pi/agent/secrets.json with 0600 permissions.
+ * Also supports in-memory runtime overrides via setRuntimeApiKey().
  *
- * IMPORTANT: AuthStorage separates persisted data (this.data in auth.json)
- * from runtime overrides (this.runtimeOverrides set via setRuntimeApiKey).
- * The has(), get(), and list() methods only consult auth.json data, NOT
- * runtime overrides. Since the secret-store extension uses setRuntimeApiKey()
+ * The has(), get(), and list() methods only consult the persisted JSON data,
+ * NOT runtime overrides. Since the secret-store extension uses setRuntimeApiKey()
  * for ephemeral/blocklisted secrets, we must always check ephemeralSecrets
  * alongside auth.has()/auth.list()/auth.get() to avoid hiding in-memory secrets.
  */
-let auth = AuthStorage.create();
+let auth: SimpleSecretStore;
 
 /**
  * Track which keys are ephemeral (set via setRuntimeApiKey vs auth.set).
@@ -243,6 +242,10 @@ async function resolveSecretLiteral(key: string): Promise<string | undefined> {
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
+  // Initialize the secret store lazily (not at top-level) to avoid circular
+  // import timing issues with jiti's alias resolution.
+  auth = new SimpleSecretStore();
+
   // ===========================================================================
   // Lifecycle
   // ===========================================================================
@@ -277,7 +280,7 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     description:
       "Prompt the user to enter a secret value (password, API key, token, etc.) " +
-      "and store it securely. Uses PI's AuthStorage (~/.pi/agent/auth.json) with " +
+      "and store it securely. Uses a simple JSON file store (~/.pi/agent/secrets.json) with " +
       "0600 permissions. The secret can be persisted or kept only in memory. " +
       "Secrets with keys matching 'sudo', 'password', 'passwd', 'root', 'admin', " +
       "'token', or similar are NEVER persisted — the blocklist is absolute. " +
@@ -610,7 +613,7 @@ export default function (pi: ExtensionAPI) {
           "The key of the secret to use. Must have been stored via ask_secret first. " +
           "Secrets are resolved as literal values — \$VARIABLE is not interpolated " +
           "and !command is not executed. For !command resolution, use manually " +
-          "edited auth.json entries (fallback path).",
+          "edited secrets.json entries (fallback path).",
       }),
       command: Type.Optional(
         Type.String({
