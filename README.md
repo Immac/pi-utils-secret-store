@@ -24,7 +24,7 @@
 
 | Tool | Description |
 |---|---|
-| `ask_secret` | Prompt the user for a secret via TUI dialog, store in `AuthStorage` |
+| `ask_secret` | Prompt the user for a secret via TUI dialog, store in `SimpleSecretStore` |
 | `get_secret` | Check a secret is accessible — **never reveals any part of the value, not even length** |
 | `with_secret` | Run a shell command with secret injected as `$SECRET` env var (sequential execution) — **never in session history** |
 | `list_secrets` | List stored keys + persistence status (disk vs session-only) |
@@ -34,7 +34,7 @@
 | `import_secret_template_add` | Register a custom regex template for non-standard formats |
 | `import_secret_template_list` | List registered custom templates |
 | `import_secret_template_remove` | Remove a registered template |
-| `get_secret_store_path` | Show `~/.pi/agent/auth.json` location |
+| `get_secret_store_path` | Show `~/.pi/agent/secrets.json` location |
 | `get_active_backend` | Show which storage backend is active |
 
 ### Commands
@@ -60,10 +60,10 @@ pi install /path/to/secret-store
 User: "Set up the database with my credentials"
 
 LLM → ask_secret(key="db_password", prompt="Enter DB password:")
-  → TUI dialog → user pastes password → "Stored secret 'db_password'. auth.json."
+  → TUI dialog → user pastes password → "Stored secret 'db_password'. secrets.json."
 
 LLM → get_secret(key="db_password")
-  → "Secret 'db_password' (auth.json) retrieved. Use with_secret to use it."
+  → "Secret 'db_password' (secrets.json) retrieved. Use with_secret to use it."
 
 LLM → with_secret(key="db_password", command="mysql -u root -p$SECRET < schema.sql")
   → Secret injected as env var, never in content. Output returned.
@@ -150,7 +150,7 @@ import_secret(path="server.cfg", template={
 ```
 get_secret("db_password")
   → resolves value internally to verify accessibility
-  → content: "Secret 'db_password' (auth.json) retrieved"
+  → content: "Secret 'db_password' (secrets.json) retrieved"
   → ✓ no value, no prefix, no length in content
   → ✓ session file has no value
   → ✓ compaction has no value
@@ -172,7 +172,7 @@ interpolated, and `!command` is not executed. This prevents:
 - `${HOME}`-style template references from leaking environment info
 
 If you need shell-command resolution (e.g., `!pass show api/key`), manually edit
-`~/.pi/agent/auth.json` — the fallback path preserves this feature for explicit use.
+`~/.pi/agent/secrets.json` — the fallback path preserves this feature for explicit use.
 
 ### Blocklist
 
@@ -238,7 +238,7 @@ read(path="~/.aws/credentials")
 ## 📖 Resources
 
 - [Pi Extension Docs](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/extensions.md)
-- [AuthStorage API](https://github.com/earendil-works/pi-coding-agent)
+- [SimpleSecretStore source](./src/extensions/secret-store/simple-store.ts)
 - [Credential Guard](https://github.com/Immac/pi-utils-credential-guard) — blocks reading of credential files
 
 ---

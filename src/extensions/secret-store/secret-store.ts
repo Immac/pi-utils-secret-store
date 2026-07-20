@@ -961,7 +961,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Delete a single stored secret by key. Requires the user to type the secret's name " +
       "in a confirmation prompt before deletion proceeds — nothing is deleted by accident. " +
-      "Removes the secret from both disk (auth.json) and in-memory runtime overrides. " +
+      "Removes the secret from both disk (secrets.json) and in-memory runtime overrides. " +
       "After clearing, you will need to call ask_secret to get a new value.\n\n" +
       "Use when a credential has been rotated, compromised, or is no longer needed. " +
       "Use forget_secrets instead if you want to wipe everything at once.",
@@ -1053,7 +1053,7 @@ export default function (pi: ExtensionAPI) {
       "⚠ IRREVERSIBLE — Clear ALL stored secrets from disk and memory. " +
       "Requires the user to type a long confirmation phrase before anything " +
       "is wiped — nothing is deleted by accident. " +
-      "All persisted secrets in ~/.pi/agent/auth.json are deleted, and all " +
+      "All persisted secrets in ~/.pi/agent/secrets.json are deleted, and all " +
       "in-memory ephemeral secrets (e.g., sudo passwords) are cleared. " +
       "The user will need to re-enter every secret via ask_secret.\n\n" +
       "Use this only when explicitly asked (e.g., 'clear all my credentials', 'start fresh'). " +
@@ -1619,8 +1619,8 @@ export default function (pi: ExtensionAPI) {
     description: "Show the secret store file path",
     handler: async (_args, ctx) => {
       const path = process.env.HOME
-        ? `${process.env.HOME}/.pi/agent/auth.json`
-        : "~/.pi/agent/auth.json";
+        ? `${process.env.HOME}/.pi/agent/secrets.json`
+        : "~/.pi/agent/secrets.json";
       ctx.ui.notify(`📁 ${path}`, "info");
     },
   });

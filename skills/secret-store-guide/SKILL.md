@@ -102,10 +102,10 @@ secrets from disk and memory. No undo.
 
 ### `get_secret_store_path()` / `get_active_backend()`
 
-- `get_secret_store_path()` — returns the file path to the active auth storage
-  (`~/.pi/agent/auth.json`)
-- `get_active_backend()` — returns `AuthStorage (auth.json)` — PI's built-in
-  credential store backed by a JSON file with 0600 permissions.
+- `get_secret_store_path()` — returns the file path to the active secret store
+  (`~/.pi/agent/secrets.json`)
+- `get_active_backend()` — returns `SimpleSecretStore (secrets.json)` — a
+  JSON file store backed by 0600 permissions.
 
 ### `import_secret(path, template?)`
 
@@ -244,10 +244,10 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 |---------|-------------|
 | No dialog | Not in interactive mode (`--print`/`--json`). Falls back to unmasked `ui.input()`. |
 | "Not found" but stored | Was it blocked? Was it cleared in a prior session? Run `list_secrets()`. |
-| Encrypted file broken | `~/.pi/agent/auth.json` must be `0600`. Use `get_active_backend()` to check. |
+| Encrypted file broken | `~/.pi/agent/secrets.json` must be `0600`. Use `get_active_backend()` to check. |
 | Accidental wipe | Confirmation required to wipe — user typed the phrase. No undo. Re-enter credentials. |
 
-**Audit checklist:** `list_secrets()` shows only expected keys · Blocked keys show 🧠 · `auth.json` permissions `0600` · `~/.pi/agent/` permissions `0700` · No secrets visible in logs/errors.
+**Audit checklist:** `list_secrets()` shows only expected keys · Blocked keys show 🧠 · `secrets.json` permissions `0600` · `~/.pi/agent/` permissions `0700` · No secrets visible in logs/errors.
 
 ---
 
@@ -268,8 +268,8 @@ Agent: forget_secrets() or clear_secret(...) per key → user confirms
 │  import_secret(path)     → bulk import .env/json/INI      │
 │  import_secret_template_add / list / remove               │
 │    → custom regex templates for non-standard formats      │
-│  get_secret_store_path() → file path (auth.json)          │
-│  get_active_backend()    → AuthStorage (auth.json)       │
+│  get_secret_store_path() → file path (secrets.json)       │
+│  get_active_backend()    → SimpleSecretStore (secrets.json)│
 │                                                           │
 │  🧠 = ephemeral (session)    💾 = persisted (survives)    │
 │  🔒 Blocked keys NEVER persisted (sudo, password, token…) │

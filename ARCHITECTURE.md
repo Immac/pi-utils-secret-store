@@ -30,19 +30,19 @@ The Secret Store extension provides pi agents with safe, auditable credential ma
       └──────┬──────┘   └──────┬──────┘  │  → parseWithTmpl│
              │                 │         └───┬────────────┘
              ▼                 ▼             ▼
-      ┌─────────────────────────────────────────────┐
-      │          AuthStorage (~/.pi/agent/auth.json) │
-      │  ┌─────────────┐  ┌──────────────────┐      │
-      │  │ persisted    │  │ runtimeOverrides  │     │
-      │  │ (this.data)  │  │ (in-memory map)  │     │
-      │  └─────────────┘  └──────────────────┘      │
-      └─────────────────────────────────────────────┘
+      ┌──────────────────────────────────────────────┐
+      │     SimpleSecretStore (~/.pi/agent/secrets.json)│
+      │  ┌─────────────┐  ┌──────────────────┐       │
+      │  │ persisted    │  │ runtimeOverrides  │      │
+      │  │ (this.data)  │  │ (in-memory map)  │      │
+      │  └─────────────┘  └──────────────────┘       │
+      └──────────────────────────────────────────────┘
              │                 │
              ▼                 ▼
-      ┌─────────────┐  ┌──────────────┐
-      │ auth.json   │  │ session-only │
-      │ 0600 perms  │  │ (ephemeral)  │
-      └─────────────┘  └──────────────┘
+      ┌──────────────┐  ┌──────────────┐
+      │ secrets.json │  │ session-only │
+      │ 0600 perms   │  │ (ephemeral)  │
+      └──────────────┘  └──────────────┘
 ```
 
 ---
@@ -55,10 +55,10 @@ The extension maintains two parallel storage tiers, tracked independently:
 
 | Tier | Backend | Lifecycle | Use Case |
 |------|---------|----------|----------|
-| **Persisted** | `AuthStorage.data` → `auth.json` (0600) | Survives restarts | API keys, tokens, non-sensitive credentials |
-| **Runtime** | `AuthStorage.runtimeOverrides` (in-memory) + `ephemeralSecrets` Set | Cleared on `session_shutdown` | Blocked keys (sudo, password, token, …), explicit `persist: false` |
+| **Persisted** | `SimpleSecretStore.data` → `secrets.json` (0600) | Survives restarts | API keys, tokens, non-sensitive credentials |
+| **Runtime** | `SimpleSecretStore.runtimeOverrides` (in-memory) + `ephemeralSecrets` Set | Cleared on `session_shutdown` | Blocked keys (sudo, password, token, …), explicit `persist: false` |
 
-**Why two tiers?** The `AuthStorage` API separates `set()` (persisted to JSON) from `setRuntimeApiKey()` (in-memory only). But `AuthStorage.has()` and `AuthStorage.list()` only query the persisted tier — they don't see runtime overrides. The extension bridges this gap with:
+**Why two tiers?** The `SimpleSecretStore` API separates `set()` (persisted to JSON) from `setRuntimeApiKey()` (in-memory only). But `SimpleSecretStore.has()` and `SimpleSecretStore.list()` only query the persisted tier — they don't see runtime overrides. The extension bridges this gap with:
 
 - `ephemeralSecrets: Set<string>` — tracks keys stored via `setRuntimeApiKey()`
 - `volatileSecrets: Set<string>` — subset that can be deleted without confirmation
@@ -73,7 +73,7 @@ get_secret(key)         → resolves value internally to verify accessibility
                           returns: "Secret 'key' retrieved. Use with_secret."
                           ✓ never reveals value, length, prefix, or suffix
 
-with_secret(key, cmd)   → looks up value via AuthStorage.getApiKey()
+with_secret(key, cmd)   → looks up value via SimpleSecretStore.getApiKey()
                           → injects as $SECRET env var
                           → child_process.exec() with { env: { SECRET: value } }
                           ✓ never in tool result content
@@ -133,7 +133,7 @@ export function redactSecretFromOutput(output: string, secret: string): string {
 ### 7. Literal Secret Resolution (resolveConfigValue Bypass)
 
 Secrets stored via `ask_secret` are resolved as **literal values** — the extension does
-NOT pass them through AuthStorage's `resolveConfigValue`, which would interpret `$VARIABLE`
+NOT pass them through `resolveConfigValue`, which would interpret `$VARIABLE`
 as environment variable references and `!command` as shell execution.
 
 The `resolveSecretLiteral()` helper uses a three-tier resolution:
@@ -251,7 +251,7 @@ Agent: import_secret(path="~/.aws/credentials")
 
 ```
 session_start
-  ├─ auth.reload() (re-read auth.json)
+  ├─ auth.reload() (re-read secrets.json)
   ├─ count = allSecretKeys().length
   └─ ctx.ui.setStatus("secret-store", "🔐 7 secret(s)")
 
@@ -262,7 +262,7 @@ session_shutdown
   │     auth.removeRuntimeApiKey(key)
   ├─ ephemeralSecrets.clear()
   └─ volatileSecrets.clear()
-       (runtime-only secrets lost; persisted secrets survive in auth.json)
+       (runtime-only secrets lost; persisted secrets survive in secrets.json)
 ```
 
 ---
@@ -273,14 +273,14 @@ session_shutdown
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `auth` | `AuthStorage` | Singleton wrapping `~/.pi/agent/auth.json` |
+| `auth` | `SimpleSecretStore` | Singleton wrapping `~/.pi/agent/secrets.json` |
 | `ephemeralSecrets` | `Set<string>` | Keys stored via `setRuntimeApiKey()` (not in JSON) |
 | `volatileSecrets` | `Set<string>` | Subset of ephemeral — no confirmation needed to delete |
 | `templateCache` | `CredentialTemplate[] \| null` | Lazily loaded from `secret-import-templates.json` |
 
 ### Boot Order
 
-1. Module loads → `AuthStorage.create()` initializes `auth`
+1. Module loads → `new SimpleSecretStore()` initializes `auth`
 2. Plugin factory `default function(pi: ExtensionAPI)` registers all tools
 3. `session_start` → `auth.reload()` syncs with disk, sets status
 4. Tools execute during conversation
