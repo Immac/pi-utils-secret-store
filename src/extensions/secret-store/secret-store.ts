@@ -1141,21 +1141,21 @@ export default function (pi: ExtensionAPI) {
     label: "Get Secret Store Info",
     description:
       "Get information about the active secret storage backend and its location. " +
-      "Returns the path to ~/.pi/agent/auth.json (PI's built-in AuthStorage).",
+      "Returns the path to ~/.pi/agent/secrets.json (SimpleSecretStore)."
     promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
       const path = process.env.HOME
-        ? `${process.env.HOME}/.pi/agent/auth.json`
-        : "~/.pi/agent/auth.json";
+        ? `${process.env.HOME}/.pi/agent/secrets.json`
+        : "~/.pi/agent/secrets.json";
       return {
         content: [
           {
             type: "text" as const,
-            text: `AuthStorage: ${path}`,
+            text: `SimpleSecretStore: ${path}`,
           },
         ],
-        details: { backend: "AuthStorage (auth.json)", path },
+        details: { backend: "SimpleSecretStore (secrets.json)", path },
       };
     },
   });
@@ -1169,7 +1169,7 @@ export default function (pi: ExtensionAPI) {
     label: "Get Active Backend",
     description:
       "Get the name of the active secret storage backend. " +
-      "Returns 'AuthStorage (auth.json)' — PI's built-in credential store.",
+      "Returns 'SimpleSecretStore (secrets.json)' — a JSON file store backed by 0600 permissions.",
     promptSnippet: "Get the active secret storage backend name",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -1177,10 +1177,10 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: "Active secret storage: AuthStorage (~/.pi/agent/auth.json)",
+            text: "Active secret storage: SimpleSecretStore (~/.pi/agent/secrets.json)",
           },
         ],
-        details: { backend: "AuthStorage (auth.json)" },
+        details: { backend: "SimpleSecretStore (secrets.json)" },
       };
     },
   });
