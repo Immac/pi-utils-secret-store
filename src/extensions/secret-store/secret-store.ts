@@ -116,41 +116,69 @@ function secretGet(key: string): unknown {
 }
 
 // =============================================================================
-// Blocklist — keys matching these patterns are NEVER persisted
+// Volatility rules — which keys may reach disk
 // =============================================================================
+// Categories by revocability:
+//   HARD — human-knowledge secrets (passwords, sudo, root, passphrases). High
+//   blast radius, no revocation story → ALWAYS runtime-only, never persisted.
+//   Everything else (API keys, tokens, PATs) is machine-issued and revocable
+//   by design → persistable by default.
+// Env knobs (both comma-separated, matched against the normalized key as full
+// match OR substring):
+//   SECRET_STORE_VOLATILE      — extra keys/patterns forced runtime-only
+//   SECRET_STORE_PERSIST_ALLOW — keys the operator says are safe even though the
+//                                name looks password-ish (NEVER unlocks hard
+//                                sudo / root / password patterns)
 
-const BLOCKLIST = new Set([
-  "sudo",
+const HARD_BLOCKED_PATTERNS = [
   "password",
   "passwd",
   "pass",
+  "passphrase",
+  "sudo",
   "root",
-  "admin",
-  "root_password",
-  "sudo_password",
-  "admin_password",
-  "db_password",
-  "database_password",
   "pgpass",
   "mysql_password",
-  "ssh_key",
-  "ssh_key_passphrase",
-  "token",
-  "access_token",
-  "secret_token",
-  "api_secret",
-]);
+];
+
+const SOFT_VOLATILE_PATTERNS = [
+  "sudo",
+  "root",
+  "pass",
+  "passphrase",
+  "password",
+  "passwd",
+];
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9_]/g, "");
 }
 
-function isDoNotPersist(key: string): boolean {
+function envKeyList(name: string): string[] {
+  return (process.env[name]?.split(",") || []).map((s) => s.trim()).filter(Boolean);
+}
+
+function matchesAny(normalized: string, patterns: string[]): boolean {
+  return patterns.some((p) => {
+    const np = normalizeKey(p);
+    return np ? normalized.includes(np) : false;
+  });
+}
+
+/**
+ * True if the key must never reach disk:
+ *   1. hard patterns (password/sudo/root surface, passphrases) — no override,
+ *   2. or explicitly listed via SECRET_STORE_VOLATILE.
+ * SECRET_STORE_PERSIST_ALLOW can suppress the soft lists for look-alike keys,
+ * but never rule (1).
+ */
+export function isDoNotPersist(key: string): boolean {
   const normalized = normalizeKey(key);
-  if (BLOCKLIST.has(normalized)) return true;
-  for (const entry of BLOCKLIST) {
-    if (normalized.includes(entry)) return true;
-  }
+  if (matchesAny(normalized, HARD_BLOCKED_PATTERNS)) return true;
+  const allow = envKeyList("SECRET_STORE_PERSIST_ALLOW");
+  if (allow.length && matchesAny(normalized, allow) && !matchesAny(normalized, HARD_BLOCKED_PATTERNS)) return false;
+  if (matchesAny(normalized, SOFT_VOLATILE_PATTERNS)) return true;
+  if (matchesAny(normalized, envKeyList("SECRET_STORE_VOLATILE"))) return true;
   return false;
 }
 
@@ -280,12 +308,13 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     description:
       "Prompt the user to enter a secret value (password, API key, token, etc.) " +
-      "and store it securely. Uses a simple JSON file store (~/.pi/agent/secrets.json) with " +
+      "and store it securely. Stores in ~/.pi/agent/auth.json with " +
       "0600 permissions. The secret can be persisted or kept only in memory. " +
-      "Secrets with keys matching 'sudo', 'password', 'passwd', 'root', 'admin', " +
-      "'token', or similar are NEVER persisted — the blocklist is absolute. " +
-      "Use this when you need a credential the user hasn't provided yet.\n\n" +
-      "Storage supports !command syntax: if you manually edit auth.json, " +
+      "Secrets whose keys look like passwords, sudo/root credentials, or passphrases are NEVER persisted " +
+      "— that rule is absolute. API keys and machine-issued tokens persist by default " +
+      "(they are revocable). Additional volatile keys can be forced via the " +
+      "SECRET_STORE_VOLATILE env var.\n\n" +
+      "Storage supports !command syntax: if you manually edit auth.json, " + +
       "the key value can be a shell command prefixed with ! (e.g., " +
       '"!pass show api/key"), and AuthStorage will resolve it at runtime.',
     promptSnippet: "Prompt the user for a secret (password, API key, token) and store it securely",
@@ -300,8 +329,9 @@ export default function (pi: ExtensionAPI) {
       key: Type.String({
         description:
           "Identifier for the secret (e.g., 'github_token', 'database_password', 'sudo'). " +
-          "Secrets with key patterns like 'sudo', 'password', 'root', 'admin', 'token' are " +
-          "ALWAYS kept in-memory only — the blocklist is absolute and cannot be overridden.",
+          "Secrets whose keys look like passwords / sudo / root creds / passphrases are " +
+          "ALWAYS kept in-memory only — that rule cannot be overridden. " +
+          "API keys and tokens persist unless SECRET_STORE_VOLATILE lists their key.",
       }),
       prompt: Type.String({
         description:

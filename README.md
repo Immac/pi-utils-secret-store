@@ -246,3 +246,15 @@ read(path="~/.aws/credentials")
 ## 📄 License
 
 MIT
+
+## Volatility rules (v1.2)
+
+Secrets are classified by **revocability**:
+
+- **Always runtime-only (cannot be overridden):** keys that look like
+  passwords, sudo/root credentials, passphrases, `pgpass`, `mysql_password`.
+- **Persisted by default:** API keys, tokens, PATs — machine-issued and
+  revocable.
+- `SECRET_STORE_PERSIST_ALLOW="key1,key2"` — re-enable persistence for keys
+  whose *name* looks password-ish (never unlocks the hard set above).
+- `SECRET_STORE_VOLATILE="key1,key2"` — force extra keys to stay session-only.

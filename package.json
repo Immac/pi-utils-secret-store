@@ -1,7 +1,7 @@
 {
   "name": "secret-store",
-  "version": "1.0.0",
-  "description": "Safe secret storage for pi agents — ask for secrets via user prompts, persist to encrypted JSON store, with do-not-persist exceptions and default sudo protection",
+  "version": "1.2.0",
+  "description": "Safe secret storage for pi agents \u2014 ask for secrets via user prompts, persist to encrypted JSON store, with do-not-persist exceptions and default sudo protection",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -13,7 +13,7 @@
   "license": "MIT",
   "scripts": {
     "validate": "tsc --noEmit --skipLibCheck",
-    "test": "npx tsx test/import-parsers.test.ts && npx tsx test/auth-storage.test.ts"
+    "test": "npx tsx test/import-parsers.test.ts && npx tsx test/auth-storage.test.ts && npx tsx test/volatile-rules.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "^0.80.0",
