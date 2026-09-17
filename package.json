@@ -13,7 +13,7 @@
   "license": "MIT",
   "scripts": {
     "validate": "tsc --noEmit --skipLibCheck",
-    "test": "npx tsx test/import-parsers.test.ts"
+    "test": "npx tsx test/import-parsers.test.ts && npx tsx test/auth-storage.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "^0.80.0",
@@ -22,9 +22,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.0",
-    "@earendil-works/pi-coding-agent": "^0.80.3",
-    "@earendil-works/pi-tui": "^0.80.0",
+    "@earendil-works/pi-ai": "^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0",
     "@types/node": "^22.0.0",
     "typebox": "^1.1.38",
     "typescript": "^5.0.0"

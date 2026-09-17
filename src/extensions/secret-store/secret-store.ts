@@ -31,7 +31,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { SimpleSecretStore } from "./simple-store.js";
+import { SimpleAuthStorage } from "./auth-storage.js";
 import { confirmDestructiveAction } from "./confirm.js";
 import {
   detectFormat,
@@ -60,7 +60,7 @@ const execAsync = promisify(execCb);
  * for ephemeral/blocklisted secrets, we must always check ephemeralSecrets
  * alongside auth.has()/auth.list()/auth.get() to avoid hiding in-memory secrets.
  */
-let auth: SimpleSecretStore;
+let auth = new SimpleAuthStorage();
 
 /**
  * Track which keys are ephemeral (set via setRuntimeApiKey vs auth.set).
@@ -244,7 +244,7 @@ async function resolveSecretLiteral(key: string): Promise<string | undefined> {
 export default function (pi: ExtensionAPI) {
   // Initialize the secret store lazily (not at top-level) to avoid circular
   // import timing issues with jiti's alias resolution.
-  auth = new SimpleSecretStore();
+  auth = new SimpleAuthStorage();
 
   // ===========================================================================
   // Lifecycle
@@ -1141,7 +1141,7 @@ export default function (pi: ExtensionAPI) {
     label: "Get Secret Store Info",
     description:
       "Get information about the active secret storage backend and its location. " +
-      "Returns the path to ~/.pi/agent/secrets.json (SimpleSecretStore).",
+      "Returns the path to ~/.pi/agent/auth.json (SimpleAuthStorage).",
     promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
