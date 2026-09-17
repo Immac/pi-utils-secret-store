@@ -1141,7 +1141,7 @@ export default function (pi: ExtensionAPI) {
     label: "Get Secret Store Info",
     description:
       "Get information about the active secret storage backend and its location. " +
-      "Returns the path to ~/.pi/agent/secrets.json (SimpleSecretStore)."
+      "Returns the path to ~/.pi/agent/secrets.json (SimpleSecretStore).",
     promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
