@@ -2,8 +2,9 @@
  * Self-contained auth.json credential manager for the secret-store extension.
  *
  * Replaces the imported `AuthStorage` from @earendil-works/pi-coding-agent,
- * which is no longer exported in v0.84.0. This module reads/writes
- * ~/.pi/agent/auth.json directly with file-locking for safe concurrent access.
+ * which is no longer exported in v0.84.0. This module reads/writes the
+ * agent dir's auth.json (getAgentDir()) directly with file-locking for safe
+ * concurrent access.
  *
  * Also manages runtime (in-memory) secret overrides, since the ModelRuntime
  * API that previously handled this is not accessible to extensions.
@@ -24,6 +25,11 @@ export class SimpleAuthStorage {
     this.ensureParentDir();
     this.ensureFileExists();
     this.reload();
+  }
+
+  /** Absolute path of the backing auth.json file. */
+  get path(): string {
+    return this.authPath;
   }
 
   private ensureParentDir(): void {

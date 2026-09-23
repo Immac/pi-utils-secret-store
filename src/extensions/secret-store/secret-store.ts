@@ -1,7 +1,7 @@
 /**
  * Secret Store — Safe secret management for pi agents.
  *
- * Built on a simple JSON file store (~/.pi/agent/secrets.json) with:
+ * Built on the agent-dir auth.json credential store (SimpleAuthStorage) with:
  * - Persistent secret storage with 0600-permission JSON
  * - In-memory runtime overrides via setRuntimeApiKey()
  * - Shell command resolution via !prefix (e.g. "!pass show ...")
@@ -51,8 +51,8 @@ const execAsync = promisify(execCb);
 // =============================================================================
 
 /**
- * SimpleSecretStore-backed credential store.
- * Reads/writes ~/.pi/agent/secrets.json with 0600 permissions.
+ * SimpleAuthStorage-backed credential store.
+ * Reads/writes <agentDir>/auth.json (getAgentDir()) with 0600 permissions.
  * Also supports in-memory runtime overrides via setRuntimeApiKey().
  *
  * The has(), get(), and list() methods only consult the persisted JSON data,
@@ -308,7 +308,7 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     description:
       "Prompt the user to enter a secret value (password, API key, token, etc.) " +
-      "and store it securely. Stores in ~/.pi/agent/auth.json with " +
+      `and store it securely. Stores in ${join(getAgentDir(), "auth.json")} with ` +
       "0600 permissions. The secret can be persisted or kept only in memory. " +
       "Secrets whose keys look like passwords, sudo/root credentials, or passphrases are NEVER persisted " +
       "— that rule is absolute. API keys and machine-issued tokens persist by default " +
@@ -643,7 +643,7 @@ export default function (pi: ExtensionAPI) {
           "The key of the secret to use. Must have been stored via ask_secret first. " +
           "Secrets are resolved as literal values — \$VARIABLE is not interpolated " +
           "and !command is not executed. For !command resolution, use manually " +
-          "edited secrets.json entries (fallback path).",
+          "edited auth.json entries (fallback path).",
       }),
       command: Type.Optional(
         Type.String({
@@ -991,7 +991,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Delete a single stored secret by key. Requires the user to type the secret's name " +
       "in a confirmation prompt before deletion proceeds — nothing is deleted by accident. " +
-      "Removes the secret from both disk (secrets.json) and in-memory runtime overrides. " +
+      "Removes the secret from both disk (auth.json) and in-memory runtime overrides. " +
       "After clearing, you will need to call ask_secret to get a new value.\n\n" +
       "Use when a credential has been rotated, compromised, or is no longer needed. " +
       "Use forget_secrets instead if you want to wipe everything at once.",
@@ -1083,7 +1083,7 @@ export default function (pi: ExtensionAPI) {
       "⚠ IRREVERSIBLE — Clear ALL stored secrets from disk and memory. " +
       "Requires the user to type a long confirmation phrase before anything " +
       "is wiped — nothing is deleted by accident. " +
-      "All persisted secrets in ~/.pi/agent/secrets.json are deleted, and all " +
+      `All persisted secrets in ${join(getAgentDir(), "auth.json")} are deleted, and all ` +
       "in-memory ephemeral secrets (e.g., sudo passwords) are cleared. " +
       "The user will need to re-enter every secret via ask_secret.\n\n" +
       "Use this only when explicitly asked (e.g., 'clear all my credentials', 'start fresh'). " +
@@ -1171,21 +1171,19 @@ export default function (pi: ExtensionAPI) {
     label: "Get Secret Store Info",
     description:
       "Get information about the active secret storage backend and its location. " +
-      "Returns the path to ~/.pi/agent/auth.json (SimpleAuthStorage).",
+      `Returns the path to ${join(getAgentDir(), "auth.json")} (SimpleAuthStorage).`,
     promptSnippet: "Get the active secret store backend info",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const path = process.env.HOME
-        ? `${process.env.HOME}/.pi/agent/secrets.json`
-        : "~/.pi/agent/secrets.json";
+      const path = auth.path;
       return {
         content: [
           {
             type: "text" as const,
-            text: `SimpleSecretStore: ${path}`,
+            text: `SimpleAuthStorage: ${path}`,
           },
         ],
-        details: { backend: "SimpleSecretStore (secrets.json)", path },
+        details: { backend: "SimpleAuthStorage (auth.json)", path },
       };
     },
   });
@@ -1199,7 +1197,7 @@ export default function (pi: ExtensionAPI) {
     label: "Get Active Backend",
     description:
       "Get the name of the active secret storage backend. " +
-      "Returns 'SimpleSecretStore (secrets.json)' — a JSON file store backed by 0600 permissions.",
+      "Returns 'SimpleAuthStorage (auth.json)' — a JSON file store backed by 0600 permissions.",
     promptSnippet: "Get the active secret storage backend name",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
@@ -1207,10 +1205,10 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: "Active secret storage: SimpleSecretStore (~/.pi/agent/secrets.json)",
+            text: `Active secret storage: SimpleAuthStorage (${auth.path})`,
           },
         ],
-        details: { backend: "SimpleSecretStore (secrets.json)" },
+        details: { backend: "SimpleAuthStorage (auth.json)", path: auth.path },
       };
     },
   });
@@ -1648,10 +1646,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("secret-path", {
     description: "Show the secret store file path",
     handler: async (_args, ctx) => {
-      const path = process.env.HOME
-        ? `${process.env.HOME}/.pi/agent/secrets.json`
-        : "~/.pi/agent/secrets.json";
-      ctx.ui.notify(`📁 ${path}`, "info");
+      ctx.ui.notify(`📁 ${auth.path}`, "info");
     },
   });
 

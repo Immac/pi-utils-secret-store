@@ -1,7 +1,7 @@
 {
   "name": "secret-store",
-  "version": "1.2.0",
-  "description": "Safe secret storage for pi agents \u2014 ask for secrets via user prompts, persist to encrypted JSON store, with do-not-persist exceptions and default sudo protection",
+  "version": "1.2.1",
+  "description": "Safe secret storage for pi agents — ask for secrets via user prompts, persist to encrypted JSON store, with do-not-persist exceptions and default sudo protection",
   "type": "module",
   "keywords": [
     "pi-package",
