@@ -76,6 +76,10 @@ get_secret(key)         → resolves value internally to verify accessibility
 with_secret(key, cmd)   → looks up value via SimpleSecretStore.getApiKey()
                           → injects as $SECRET env var
                           → child_process.exec() with { env: { SECRET: value } }
+with_secret(keys, cmd)  → resolves ALL keys first (all-or-nothing — a missing
+                          key aborts before exec, no partial credentials)
+                          → injects each under a derived env var name
+                          → child_process.exec() with { env: { USER: ..., TOKEN: ... } }
                           ✓ never in tool result content
                           ✓ never in session history
                           ✓ never in /proc/*/cmdline
@@ -119,9 +123,11 @@ Three tools require user interaction:
 ### 6. Output Redaction
 
 After running a command, `with_secret` automatically scans `stdout` and `stderr` (both in tool
-content and the `details` result object) for the exact secret string and replaces it with
-`[REDACTED]`. This catches accidental leakage from verbose tools (e.g., `curl` logging the
-auth header) on both success and error output paths.
+content and the `details` result object) for the exact secret string(s) and replaces them with
+`[REDACTED]`. In multi-secret mode (`keys=[...]`) EVERY injected value is scanned, longest value
+first so a secret that happens to be a substring of another cannot leak in fragments. This
+catches accidental leakage from verbose tools (e.g., `curl` logging the auth header) on both
+success and error output paths.
 
 ```typescript
 export function redactSecretFromOutput(output: string, secret: string): string {

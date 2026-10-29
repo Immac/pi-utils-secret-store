@@ -16,6 +16,8 @@
  *   ask_secret(key: "github_token", prompt: "Enter your GitHub personal access token")
  *   get_secret(key: "github_token")
  *   with_secret(key: "github_token", command: "curl -H 'Authorization: Bearer $SECRET' ...")
+ *   with_secret(keys: ["kaggle_username", "kaggle_api_key"],
+ *               command: "curl -u $KAGGLE_USERNAME:$KAGGLE_API_KEY ...")
  *   list_secrets()
  *   clear_secret(key: "github_token")
  *   forget_secrets()
@@ -263,6 +265,46 @@ async function resolveSecretLiteral(key: string): Promise<string | undefined> {
 
   // Fallback: OAuth, !command, env var — goes through resolveConfigValue
   return auth.getApiKey(key);
+}
+
+// =============================================================================
+// Multi-secret env var derivation (with_secret keys=[...])
+// =============================================================================
+
+/**
+ * Derive a conventional env var name from a secret key:
+ *   "kaggle_username"         → "KAGGLE_USERNAME"
+ *   "comfyui:server:cloud-x"  → "COMFYUI_SERVER_CLOUD_X"
+ *   "2fa_token"               → "_2FA_TOKEN"   (digit-leading, invalid ident)
+ *
+ * Rules: uppercase; every run of non-alphanumerics → "_"; trim edge "_";
+ * empty result → "SECRET"; digit-leading → prefix "_".
+ */
+export function deriveEnvVarName(key: string): string {
+  let name = key.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (name === "") name = "SECRET";
+  if (/^[0-9]/.test(name)) name = `_${name}`;
+  return name;
+}
+
+/**
+ * Map each key to a UNIQUE env var name for multi-secret injection.
+ * Input order is preserved. Distinct keys can derive the same base name
+ * (e.g. "foo:bar" vs "foo_bar") — collisions get deterministic "_2", "_3", ...
+ * suffixes in input order.
+ */
+export function deriveEnvVarMap(keys: string[]): Array<{ key: string; envVar: string }> {
+  const used = new Set<string>();
+  const out: Array<{ key: string; envVar: string }> = [];
+  for (const key of keys) {
+    const base = deriveEnvVarName(key);
+    let name = base;
+    let n = 2;
+    while (used.has(name)) name = `${base}_${n++}`;
+    used.add(name);
+    out.push({ key, envVar: name });
+  }
+  return out;
 }
 
 // =============================================================================
@@ -624,6 +666,13 @@ export default function (pi: ExtensionAPI) {
       "any occurrence of the secret is replaced with [REDACTED].\n\n" +
       "The secret is available as \\$SECRET inside the command by default. " +
       "Use envVarName to pick a different variable name.\n\n" +
+      "**Multiple secrets in one command:** pass keys=[\"a\",\"b\"] instead of key. " +
+      "Each secret is injected under a derived env var name (key uppercased, " +
+      "non-alphanumerics replaced by \"_\", e.g. kaggle_username → \\$KAGGLE_USERNAME; " +
+      "collisions get _2/_3 suffixes). \\$SECRET and envVarName are NOT used in this " +
+      "mode — reference each derived name. All secrets are resolved BEFORE the " +
+      "command runs: if any key is missing, nothing executes (no partial " +
+      "credential sets). Provide exactly one of key / keys.\n\n" +
       "**Structured secrets:** Secrets may be stored as objects like " +
       '{"type": "api_key", "key": "..."} rather than plain strings. ' +
       "The tool automatically resolves these — \\$SECRET always contains " +
@@ -634,17 +683,31 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use with_secret after get_secret to use a stored secret in a command without leaking it into conversation history or bash history.",
       "The secret is available as $SECRET inside the command by default. Set envVarName to change the variable name.",
+      "Need TWO secrets in one command? Do not chain two with_secret calls (each is an isolated subprocess). Pass keys=[\"a\",\"b\"] and reference $A, $B (derived names).",
       "Secrets may be stored as structured objects (e.g., {type, key}); with_secret resolves them automatically.",
       "Use validate=true to inspect a secret's metadata without executing any command.",
     ],
     parameters: Type.Object({
-      key: Type.String({
-        description:
-          "The key of the secret to use. Must have been stored via ask_secret first. " +
-          "Secrets are resolved as literal values — \$VARIABLE is not interpolated " +
-          "and !command is not executed. For !command resolution, use manually " +
-          "edited auth.json entries (fallback path).",
-      }),
+      key: Type.Optional(
+        Type.String({
+          description:
+            "The key of a SINGLE secret to use (mutually exclusive with keys). Must have " +
+            "been stored via ask_secret first. Secrets are resolved as literal values — " +
+            "\$VARIABLE is not interpolated and !command is not executed. For !command " +
+            "resolution, use manually edited auth.json entries (fallback path).",
+        })
+      ),
+      keys: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            "Several secrets to inject in ONE call (mutually exclusive with key). Each is " +
+            "injected under a derived env var name: key uppercased with every " +
+            "non-alphanumeric run replaced by _ (kaggle_username → KAGGLE_USERNAME); " +
+            "duplicate/colliding names get _2/_3 suffixes. Reference each secret as " +
+            "\$DERIVED_NAME in the command. All keys are resolved before execution — if " +
+            "any is missing, nothing runs. Duplicates are de-duplicated.",
+        })
+      ),
       command: Type.Optional(
         Type.String({
           description:
@@ -657,7 +720,8 @@ export default function (pi: ExtensionAPI) {
         Type.String({
           description:
             "Environment variable name to inject the secret into (default: SECRET). " +
-            "Choose a descriptive name for clarity.",
+            "Single-key calls only — rejected together with keys (derived names are " +
+            "used instead).",
         })
       ),
       timeout: Type.Optional(
@@ -675,78 +739,158 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const { key, command, envVarName, timeout, validate } = params;
+      const { key, keys, command, envVarName, timeout, validate } = params;
 
-      // --- Look up the secret via AuthStorage ---
-      // auth.has() only checks auth.json data, not runtime overrides.
-      // Check ephemeralSecrets as well to find session-only secrets.
-      if (!secretExists(key)) {
+      // --- Normalize input: exactly one of key / keys must be provided ---
+      const multi = Array.isArray(keys) && keys.length > 0;
+      if ((key ? 1 : 0) + (multi ? 1 : 0) !== 1) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Secret "${key}" is not stored. Use ask_secret(key="${key}", prompt="...") first.`,
+              text:
+                `Provide exactly one of: key="..." (single secret → \$SECRET, renameable via envVarName) ` +
+                `or keys=["...","..."] (several secrets → each under its derived env var name).`,
             },
           ],
-          details: { executed: false, key, reason: "not_found" },
+          details: { executed: false, key: key ?? "", reason: "bad_key_args" },
         };
       }
 
-      // Resolve the actual value as a literal — bypass resolveConfigValue
-      // to avoid interpreting $VARIABLE or !command in user-provided secrets.
-      const secret = await resolveSecretLiteral(key);
-      if (secret === undefined) {
+      // De-duplicate while preserving order; reject empty entries.
+      const keyList = multi ? [...new Set(keys as string[])] : [key as string];
+      if (keyList.some((k) => typeof k !== "string" || k.trim() === "")) {
+        return {
+          content: [
+            { type: "text" as const, text: `"keys" entries must be non-empty secret key strings.` },
+          ],
+          details: { executed: false, key: key ?? "", reason: "bad_keys" },
+        };
+      }
+
+      // --- Env var assignment ---
+      // Single-key: $SECRET by default, renameable via envVarName (legacy
+      // behavior, unchanged). keys mode: each secret gets a derived unique
+      // name; envVarName is rejected so the mapping stays predictable.
+      let envVars: Array<{ key: string; envVar: string }>;
+      if (multi) {
+        if (envVarName) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `envVarName is only for single-key calls. With "keys", each secret gets a ` +
+                  `derived env var name — run with validate=true to see the full mapping.`,
+              },
+            ],
+            details: { executed: false, key: keyList.join(","), reason: "envvar_with_keys" },
+          };
+        }
+        envVars = deriveEnvVarMap(keyList);
+      } else {
+        envVars = [{ key: keyList[0], envVar: envVarName || "SECRET" }];
+      }
+
+      // --- Fail fast: ALL secrets must exist and resolve BEFORE anything runs.
+      // A partially-injected credential set is worse than a hard error. ---
+      const missing = envVars.filter((e) => !secretExists(e.key)).map((e) => e.key);
+      if (missing.length > 0) {
+        const list = missing.map((k) => `"${k}"`).join(", ");
         return {
           content: [
             {
               type: "text" as const,
-              text: `Secret "${key}" could not be resolved. Use ask_secret(key="${key}", prompt="...") to store it.`,
+              text:
+                `Secret${missing.length > 1 ? "s" : ""} ${list} not stored. ` +
+                `Use ask_secret(key="...", prompt="...") first.`,
             },
           ],
-          details: { executed: false, key, reason: "resolution_failed" },
+          details: { executed: false, key: keyList.join(","), reason: "not_found", missing },
         };
       }
 
-      const varName = envVarName || "SECRET";
-      const isEphemeral = ephemeralSecrets.has(key);
-      const isVolatile = volatileSecrets.has(key);
-      const source = isEphemeral
-        ? (isVolatile ? "volatile (auto-cleared on session end)" : "runtime override (session-only)")
-        : "auth.json (persisted)";
-      const hasStructure = rawHasStructure(key);
+      const resolved: Array<{
+        key: string; envVar: string; value: string; source: string; hasStructure: boolean;
+      }> = [];
+      for (const { key: k, envVar } of envVars) {
+        // Resolve the actual value as a literal — bypass resolveConfigValue
+        // to avoid interpreting $VARIABLE or !command in user-provided secrets.
+        const value = await resolveSecretLiteral(k);
+        if (value === undefined) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Secret "${k}" could not be resolved. Use ask_secret(key="${k}", prompt="...") to store it.`,
+              },
+            ],
+            details: { executed: false, key: keyList.join(","), reason: "resolution_failed", failedKey: k },
+          };
+        }
+        const isEphemeral = ephemeralSecrets.has(k);
+        const isVolatile = volatileSecrets.has(k);
+        const source = isEphemeral
+          ? (isVolatile ? "volatile (auto-cleared on session end)" : "runtime override (session-only)")
+          : "auth.json (persisted)";
+        resolved.push({ key: k, envVar, value, source, hasStructure: rawHasStructure(k) });
+      }
+
+      // Legacy single-entry display fields (keeps the details shape backward
+      // compatible for renderers), plus the full mapping for multi-secret calls.
+      const displayKey = resolved.map((r) => r.key).join(",");
+      const primaryEnvVar = resolved[0].envVar;
+      const envVarMapObj = Object.fromEntries(resolved.map((r) => [r.key, r.envVar]));
+
+      // Redact EVERY injected value, longest first so a secret that happens to
+      // be a substring of another is fully covered by the longer match before
+      // the shorter pattern runs.
+      const redactValues = [...new Set(resolved.map((r) => r.value))]
+        .filter((v) => v.length >= 3)
+        .sort((a, b) => b.length - a.length);
+      const redactAll = (text: string): string =>
+        redactValues.reduce((acc, v) => redactSecretFromOutput(acc, v), text);
 
       // --- Validate mode: dry-run, no command execution ---
-      // NEVER leak any part of the value — no prefix, no suffix, no length.
+      // NEVER leak any part of any value — no prefix, no suffix, no length.
       if (validate) {
-        let typeDesc = "plain string";
-        if (hasStructure) {
-          const raw = auth.get(key);
-          const t = raw && typeof raw === "object"
-            ? (raw as Record<string, unknown>).type
-            : undefined;
-          typeDesc = typeof t === "string" ? `structured (${t})` : "structured (unknown type)";
+        const lines: string[] = [];
+        for (const r of resolved) {
+          let typeDesc = "plain string";
+          if (r.hasStructure) {
+            const raw = auth.get(r.key);
+            const t = raw && typeof raw === "object"
+              ? (raw as Record<string, unknown>).type
+              : undefined;
+            typeDesc = typeof t === "string" ? `structured (${t})` : "structured (unknown type)";
+          }
+          lines.push(
+            `✓ Secret "${r.key}" is accessible via \$${r.envVar}`,
+            `  • Type: ${typeDesc}`,
+            `  • Source: ${r.source}`,
+            `  • Resolution: ${r.hasStructure ? "auto-resolved from structured object" : "direct"}`,
+            ``
+          );
         }
-
-        const lines = [
-          `✓ Secret "${key}" is accessible via \$${varName}`,
-          `  • Type: ${typeDesc}`,
-          `  • Source: ${source}`,
-          `  • Resolution: ${hasStructure ? "auto-resolved from structured object" : "direct"}`,
-          ``,
-          `Ready for with_secret(key="${key}", command="..."). ` +
-          `Use \$${varName} inside the command to reference the secret.`,
-        ];
+        lines.push(
+          multi
+            ? `Ready: reference each secret as \$${resolved.map((r) => r.envVar).join(", \$")} inside the command.`
+            : `Ready for with_secret(key="${resolved[0].key}", command="..."). ` +
+              `Use \$${primaryEnvVar} inside the command to reference the secret.`
+        );
 
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],
           details: {
             executed: true,
-            key,
-            envVar: varName,
+            key: displayKey,
+            envVar: primaryEnvVar,
+            keys: keyList,
+            envVars: envVarMapObj,
             exitCode: 0,
             mode: "validate",
-            source,
-            hasStructure,
+            source: resolved[0].source,
+            hasStructure: resolved[0].hasStructure,
           },
         };
       }
@@ -760,11 +904,14 @@ export default function (pi: ExtensionAPI) {
               text: `No command provided. Either pass a command to execute, or set validate=true for a dry-run check.`,
             },
           ],
-          details: { executed: false, key, reason: "no_command" },
+          details: { executed: false, key: displayKey, reason: "no_command" },
         };
       }
 
-      // --- Inject as env var and run ---
+      // --- Inject as env vars and run ---
+      const injectionEnv: Record<string, string> = {};
+      for (const r of resolved) injectionEnv[r.envVar] = r.value;
+
       const cwd = ctx.cwd;
       const maxBytes = 50 * 1024;
       const maxLines = 2000;
@@ -774,7 +921,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const { stdout, stderr } = await execAsync(command, {
           cwd,
-          env: { ...process.env, [varName]: secret },
+          env: { ...process.env, ...injectionEnv },
           timeout: effectiveTimeout,
           maxBuffer: maxBytes,
           signal,
@@ -788,9 +935,9 @@ export default function (pi: ExtensionAPI) {
             `\n\n[Output truncated: ${Math.min(lines.length, maxLines)} of ${lines.length} lines]`
           : stdout;
 
-        // Redact the secret from output and stderr to prevent accidental leaks
-        const safeOutput = redactSecretFromOutput(output, secret);
-        const safeStderr = redactSecretFromOutput(stderr ?? "", secret);
+        // Redact every injected secret from output and stderr to prevent leaks
+        const safeOutput = redactAll(output);
+        const safeStderr = redactAll(stderr ?? "");
 
         return {
           content: [
@@ -801,8 +948,10 @@ export default function (pi: ExtensionAPI) {
           ],
           details: {
             executed: true,
-            key,
-            envVar: varName,
+            key: displayKey,
+            envVar: primaryEnvVar,
+            keys: keyList,
+            envVars: envVarMapObj,
             exitCode: 0,
             stderr: safeStderr,
             truncated,
@@ -836,9 +985,9 @@ export default function (pi: ExtensionAPI) {
         const stderr = typeof execErr.stderr === "string" ? execErr.stderr : "";
         const stdout = typeof execErr.stdout === "string" ? execErr.stdout : "";
 
-        // Redact the secret from error output to prevent accidental leaks
-        const safeStdout = redactSecretFromOutput(stdout, secret);
-        const safeStderr = redactSecretFromOutput(stderr, secret);
+        // Redact every injected secret from error output to prevent leaks
+        const safeStdout = redactAll(stdout);
+        const safeStderr = redactAll(stderr);
 
         // Build a diagnostic message
         const diagParts: string[] = [];
@@ -864,8 +1013,10 @@ export default function (pi: ExtensionAPI) {
           ],
           details: {
             executed: true,
-            key,
-            envVar: varName,
+            key: displayKey,
+            envVar: primaryEnvVar,
+            keys: keyList,
+            envVars: envVarMapObj,
             exitCode,
             killed: isKilled,
             signal: signalName,
@@ -876,19 +1027,25 @@ export default function (pi: ExtensionAPI) {
       }
     },
     renderCall(args, theme, _context) {
-      const varName = args.envVarName || "SECRET";
+      const multiKeys = Array.isArray(args.keys) && args.keys.length > 0
+        ? [...new Set(args.keys as string[])]
+        : null;
+      const keyLabel = multiKeys ? multiKeys.join(", ") : (args.key ?? "");
+      const varLabel = multiKeys
+        ? deriveEnvVarMap(multiKeys).map((e) => `\$${e.envVar}`).join(",")
+        : `\$${args.envVarName || "SECRET"}`;
       const cmdPreview = args.command?.slice(0, 80) ?? "<validate>";
       return new Text(
         theme.fg("toolTitle", theme.bold("with_secret ")) +
-        theme.fg("accent", args.key) +
-        theme.fg("muted", ` → \$${varName} `) +
+        theme.fg("accent", keyLabel) +
+        theme.fg("muted", ` → ${varLabel} `) +
         theme.fg("dim", cmdPreview),
         0, 0
       );
     },
     renderResult(result, _options, theme, _context) {
       const details = result.details as
-        | { executed: boolean; key: string; exitCode?: number; reason?: string }
+        | { executed: boolean; key: string; keys?: string[]; exitCode?: number; reason?: string }
         | undefined;
 
       if (!details?.executed) {
@@ -903,9 +1060,10 @@ export default function (pi: ExtensionAPI) {
         ? theme.fg("success", "✓ ")
         : theme.fg("error", `✗ (exit ${code}) `);
 
+      const label = details.keys?.length ? details.keys.join(",") : details.key;
       return new Text(
         status +
-        theme.fg("accent", details.key),
+        theme.fg("accent", label),
         0, 0
       );
     },

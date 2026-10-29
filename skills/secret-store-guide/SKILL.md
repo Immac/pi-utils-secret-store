@@ -72,17 +72,25 @@ Use `showStructure=true` to inspect a secret's storage metadata (type, auth
 scheme, source) without exposing the raw value. Useful before calling
 `with_secret` to understand how the secret is structured.
 
-### `with_secret(key, command, envVarName?, timeout?, validate?)`
+### `with_secret(key | keys, command, envVarName?, timeout?, validate?)`
 
-Runs a shell command with the secret injected as an environment variable.
+Runs a shell command with the secret(s) injected as environment variable(s).
 The secret is resolved as a **literal value** — \$VARIABLE is NOT
 interpolated and !command is NOT executed. The value is never exposed in
 tool content, session history, or bash history. stdout and stderr are
 automatically scanned and the secret is replaced with [REDACTED].
 Reference via `$SECRET` (or `$envVarName` if set).
 
-Use `validate: true` to dry-run — checks the secret is accessible and reports
-its type (plain string, structured) and source (auth.json, session-only)
+**Multiple secrets:** pass `keys: ["a","b"]` instead of `key` — each secret
+is injected under a derived env var name (key uppercased, non-alphanumerics
+→ `_`; `kaggle_username` → `$KAGGLE_USERNAME`; collisions get `_2`/`_3`
+suffixes). All keys resolve BEFORE execution: a missing key aborts with the
+culprit named, and the command never runs with a partial credential set.
+`envVarName` is rejected in this mode. Every injected value is redacted
+from output (longest-first). `\$SECRET` is only used in single-`key` mode.
+
+Use `validate: true` to dry-run — checks the secret(s) are accessible and report
+their type (plain string, structured) and source (auth.json, session-only)
 **without revealing any part of the value**.
 
 ### `list_secrets()`

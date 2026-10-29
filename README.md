@@ -26,7 +26,7 @@
 |---|---|
 | `ask_secret` | Prompt the user for a secret via TUI dialog, store in `SimpleSecretStore` |
 | `get_secret` | Check a secret is accessible — **never reveals any part of the value, not even length** |
-| `with_secret` | Run a shell command with secret injected as `$SECRET` env var (sequential execution) — **never in session history** |
+| `with_secret` | Run a shell command with secret(s) injected as env vars (`$SECRET`, or per-key derived names via `keys=[...]`) (sequential execution) — **never in session history** |
 | `list_secrets` | List stored keys + persistence status (disk vs session-only) |
 | `clear_secret` | Delete one secret (requires typed name to confirm) |
 | `forget_secrets` | Wipe ALL secrets (requires typed affirmation phrase) |
@@ -100,6 +100,21 @@ ask_secret(key="github_token", prompt="Enter your GitHub PAT")
 with_secret(key="github_token", command="curl -H 'Authorization: Bearer $SECRET' https://api.github.com/user")
 ```
 
+### Using several secrets in one command
+
+Pass `keys` instead of `key` — each secret is injected under a derived env var
+name (key uppercased, non-alphanumerics → `_`; collisions get `_2`/`_3`
+suffixes). All keys resolve before the command runs (all-or-nothing), and
+every injected value is redacted from output:
+
+```
+with_secret(
+  keys=["kaggle_username", "kaggle_api_key"],
+  command="curl -u $KAGGLE_USERNAME:$KAGGLE_API_KEY https://www.kaggle.com/api/v1/..."
+)
+with_secret(keys=["kaggle_username", "kaggle_api_key"], validate=true)  # dry-run: prints the mapping
+```
+
 ### Importing from a file
 
 ```
@@ -161,6 +176,11 @@ with_secret(key="db_password", command="mysql -u root -p$SECRET")
   → stdout + stderr both redacted (content AND details)
   → ✓ no secret in tool content, session file, or bash history
   → ✓ no secret in /proc/*/cmdline (env only, not args)
+
+with_secret(keys=["user", "token"], command="curl -u $USER:$TOKEN ...")
+  → resolves ALL keys first (missing key → hard error, command never runs)
+  → child_process.exec with env: { USER: "...", TOKEN: "..." } (derived names)
+  → every injected value redacted from stdout + stderr (longest-first)
 ```
 
 ### Literal resolution (no interpolation)

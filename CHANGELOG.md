@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+
+- **Multi-secret injection in `with_secret`** — new optional `keys: string[]` parameter injects several secrets into ONE subprocess, each under a derived env var name (key uppercased, every non-alphanumeric run replaced by `_`; e.g. `kaggle_username` → `$KAGGLE_USERNAME`, `comfyui:server:cloud-comfy` → `$COMFYUI_SERVER_CLOUD_COMFY`; duplicates/collisions get deterministic `_2`, `_3`… suffixes). Provide exactly one of `key` / `keys`.
+  - **All-or-nothing:** every key is resolved *before* execution — a missing or unresolvable key aborts with the culprit named; the command never runs with a partial credential set.
+  - **Redaction for every injected value**, longest-first so a secret that is a substring of another cannot leak in fragments.
+  - `validate: true` dry-runs the full mapping (var name, type, source per key) with zero value leakage.
+  - `envVarName` is rejected in `keys` mode (single-`key` calls keep the exact legacy `$SECRET` / `envVarName` behavior).
+  - Tool result details gained `keys` / `envVars` alongside the backward-compatible `key` / `envVar` fields; the TUI call/result renderers show the whole mapping.
+- `deriveEnvVarName` / `deriveEnvVarMap` helpers (exported) + tests (`test/multi-secret.test.ts`).
+
 ## 1.2.1
 
 ### Fixed
